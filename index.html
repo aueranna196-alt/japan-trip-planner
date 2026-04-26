@@ -81,104 +81,83 @@
       </div>;
     }
 
-    // ── AI (via Vercel proxy) ─────────────────────────────────────────────────
-    const PROXY = "/api/proxy";
-
+    // ── AI via Gemini (free) ──────────────────────────────────────────────────
     const SYSTEM_PROMPT = `Du bist ein Reiseplanungs-Assistent für eine Japanreise (12.–28. Mai 2026, Städte: Osaka, Kyoto, Atami, Tokyo).
-Extrahiere strukturierte Daten und gib NUR ein JSON-Objekt zurück, KEIN Markdown, KEINE Erklärung.
+Extrahiere strukturierte Daten und gib NUR ein JSON-Objekt zurück, KEIN Markdown, KEINE Erklärung, keine Codeblöcke.
 
 Reise-Tage (dayId 0-16): 0=12.Mai(Osaka),1=13.Mai(Osaka),2=14.Mai(Osaka),3=15.Mai(Osaka),4=16.Mai(Kyoto),5=17.Mai(Kyoto),6=18.Mai(Kyoto),7=19.Mai(Atami),8=20.Mai(Atami),9=21.Mai(Tokyo),10=22.Mai(Tokyo),11=23.Mai(Tokyo),12=24.Mai(Tokyo),13=25.Mai(Tokyo),14=26.Mai(Tokyo),15=27.Mai(Tokyo),16=28.Mai(Abreise)
 
 Tags: food, temple, nature, shopping, culture, transport, hotel, flight
 
-Format:
-{"message":"Bestätigung auf Deutsch","actions":[{"type":"activity|restaurant|hotel|flight|dayentry","data":{...}}]}
+Antwortformat (NUR dieses JSON, nichts sonst):
+{"message":"Kurze Bestätigung auf Deutsch","actions":[{"type":"activity|restaurant|hotel|flight|dayentry","data":{...}}]}
 
-Felder:
+Felder je Typ:
 - activity: name, city, tag, address, lat(string), lng(string), openHours, closedDay, priceJPY, note
 - restaurant: name, city, address, lat(string), lng(string), openHours, closedDay, priceJPY, note, reserved(false)
 - hotel: name, city, address, lat(string), lng(string), checkin, checkout, nights, priceJPY, note
 - flight: flightNumber, airline, from, to, dep, arr, dur, aircraft, status(scheduled), layover, date, note
 - dayentry: title, dayId(0-16), time, tag, note
 
-WICHTIG: Kein date/time bei activities/restaurants außer explizit genannt. Stadt aus Kontext ableiten (Fushimi Inari→Kyoto, Dotonbori→Osaka, Senso-ji→Tokyo). Lat/Lng als String.`;
+Regeln:
+- Kein date/time bei activities/restaurants außer explizit genannt
+- Stadt aus Kontext ableiten: Fushimi Inari→Kyoto, Dotonbori→Osaka, Senso-ji→Tokyo, Shibuya→Tokyo, Arashiyama→Kyoto
+- Lat/Lng als String z.B. "35.6762"
+- Bekannte Koordinaten direkt angeben, nicht erfinden
+- Bei mehreren Orten: mehrere actions
+- CX=Cathay Pacific, LH=Lufthansa, NH=ANA`;
 
-    async function callProxy(body){
-      const res=await fetch(PROXY,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-      if(!res.ok){ const e=await res.json().catch(()=>({})); throw new Error(e.error||`HTTP ${res.status}`); }
-      return res.json();
-    }
-
-    function extractFromGmapsUrl(url){
-      if(!url) return {};
-      const p=url.match(/\/place\/([^/@]+)/);
-      const name=p?decodeURIComponent(p[1].replace(/\+/g," ")):null;
-      const lat=url.match(/!3d([-\d.]+)/)?.[1];
-      const lng=url.match(/!4d([-\d.]+)/)?.[1];
-      return {name,lat,lng};
-    }
-
-    async function resolveViaWebSearch(shortUrl){
-      const data=await callProxy({model:"claude-sonnet-4-20250514",max_tokens:512,
-        system:`Resolve a Google Maps URL via web_search. Return ONLY JSON: {"name":"...","lat":"...","lng":"...","city":"...","address":"...","openHours":"...","tag":"temple"} or {"error":"not found"}. tag: food/temple/nature/shopping/culture/transport/hotel.`,
-        messages:[{role:"user",content:`Resolve: ${shortUrl}`}],
-        tools:[{type:"web_search_20250305",name:"web_search"}]
+    async function callAI(userMessage, history) {
+      const res = await fetch("/api/proxy", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ systemPrompt: SYSTEM_PROMPT, userMessage, history }),
       });
-      const txt=(data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
-      const m=txt.match(/\{[^{}]*\}/);
-      if(!m) return null;
-      const p=JSON.parse(m[0]);
-      return p.error?null:p;
+      if (!res.ok) {
+        const e = await res.json().catch(()=>({}));
+        throw new Error(e.error || `HTTP ${res.status}`);
+      }
+      const { text } = await res.json();
+      // Parse JSON from response (strip markdown fences if present)
+      const clean = text.replace(/```json?|```/g,"").trim();
+      const match = clean.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error("Keine gültige Antwort erhalten");
+      const parsed = JSON.parse(match[0]);
+      if (!parsed.message || !Array.isArray(parsed.actions)) throw new Error("Unerwartetes Antwortformat");
+      return parsed;
     }
 
-    async function callAI(userMsg,history){
-      const shortLinks=[...(userMsg.match(/https?:\/\/maps\.app\.goo\.gl\/\S+/g)||[])];
-      const fullLinks=[...(userMsg.match(/https?:\/\/(?:www\.)?google\.[a-z.]+\/maps\/\S+/g)||[])];
-      let extra="";
-      for(const link of shortLinks){
-        try{ const i=await resolveViaWebSearch(link); if(i) extra+=`\n[RESOLVED: ${link}] Name:${i.name}, City:${i.city}, Lat:${i.lat}, Lng:${i.lng}, Hours:${i.openHours||""}, Tag:${i.tag} → Eintrag direkt erstellen.`; }catch{}
-      }
-      for(const link of fullLinks){
-        const i=extractFromGmapsUrl(link); if(i.name) extra+=`\n[GMAPS] Name="${i.name}", lat=${i.lat}, lng=${i.lng}.`;
-      }
-      const data=await callProxy({model:"claude-sonnet-4-20250514",max_tokens:4000,system:SYSTEM_PROMPT,
-        messages:[...history,{role:"user",content:userMsg+(extra?extra:"")}],
-        tools:[{type:"web_search_20250305",name:"web_search"}]
-      });
-      const txt=(data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
-      const matches=[...txt.matchAll(/\{[\s\S]*?\}(?=\s*(?:\{|$))/g)];
-      let parsed=null;
-      for(let i=matches.length-1;i>=0;i--){ try{ const c=JSON.parse(matches[i][0]); if(c.message&&Array.isArray(c.actions)){parsed=c;break;} }catch{} }
-      if(!parsed){ try{ const m=txt.replace(/```json?|```/g,"").trim().match(/\{[\s\S]*\}/); if(m) parsed=JSON.parse(m[0]); }catch{} }
-      if(!parsed) throw new Error("Ungültige KI-Antwort");
-      return {parsed};
-    }
-
-    function AIAssistant({data,onApply}){
+    function AIAssistant({data, onApply}){
       const [input,setInput]=useState("");
       const [loading,setLoading]=useState(false);
       const [history,setHistory]=useState([]);
       const [chatLog,setChatLog]=useState([]);
       const chatRef=useRef();
+
       const examples=["Fushimi Inari Taisha, Kyoto","Ichiran Ramen Dotonbori, Osaka","Flug CX570 am 12. Mai","TeamLab Planets Tokyo, 25€","Tsukiji Outer Market, Tokyo","Arashiyama Bambushain, Kyoto"];
+
       const send=async()=>{
         if(!input.trim()||loading) return;
         const msg=input.trim(); setInput(""); setLoading(true);
         setChatLog(l=>[...l,{role:"user",text:msg}]);
         try{
-          const {parsed}=await callAI(msg,history);
+          const parsed=await callAI(msg,history);
           setHistory(h=>[...h,{role:"user",content:msg},{role:"assistant",content:JSON.stringify(parsed)}]);
           setChatLog(l=>[...l,{role:"assistant",text:parsed.message,actions:parsed.actions}]);
-        }catch(e){ setChatLog(l=>[...l,{role:"assistant",text:`❌ ${e.message}`,actions:[]}]); }
+        }catch(e){
+          setChatLog(l=>[...l,{role:"assistant",text:`❌ ${e.message}`,actions:[]}]);
+        }
         setLoading(false);
         setTimeout(()=>{ if(chatRef.current) chatRef.current.scrollTop=chatRef.current.scrollHeight; },100);
       };
+
       const apply=actions=>{ onApply(actions); setChatLog(l=>[...l,{role:"system",text:`✓ ${actions.length} Eintrag${actions.length>1?"e":""} gespeichert.`}]); };
       const typeLabel=t=>({activity:"Aktivität",restaurant:"Restaurant",hotel:"Unterkunft",flight:"Flug",dayentry:"Tageseintrag"})[t]||t;
+
       return <div style={{display:"flex",flexDirection:"column",gap:12}}>
-        <div style={{background:"#f0f9ff",border:"1px solid #bae6fd",borderRadius:12,padding:"14px 16px"}}>
-          <div style={{fontWeight:500,fontSize:14,color:"#0c4a6e",marginBottom:6}}>KI-Assistent · Einfach eintippen</div>
-          <div style={{fontSize:12,color:"#0369a1",lineHeight:1.6}}>Ortsnamen, Google Maps Links, Flugnummern – der Assistent erkennt alles automatisch.</div>
+        <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:12,padding:"14px 16px"}}>
+          <div style={{fontWeight:500,fontSize:14,color:"#14532d",marginBottom:4}}>KI-Assistent · Kostenlos via Google Gemini</div>
+          <div style={{fontSize:12,color:"#166534",lineHeight:1.6}}>Ortsnamen, Flugnummern oder Ideen eingeben – Gemini erkennt alles automatisch.</div>
         </div>
         <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{examples.map((e,i)=><button key={i} onClick={()=>setInput(e)} style={{background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:20,padding:"4px 11px",fontSize:11,color:"#6b7280",cursor:"pointer",fontFamily:"inherit"}}>{e}</button>)}</div>
         {chatLog.length>0&&<div ref={chatRef} style={{maxHeight:320,overflowY:"auto",display:"flex",flexDirection:"column",gap:8}}>
@@ -203,15 +182,16 @@ WICHTIG: Kein date/time bei activities/restaurants außer explizit genannt. Stad
             </div>}
             {m.role==="system"&&<div style={{fontSize:12,color:"#059669",padding:"4px 0",alignSelf:"center"}}>{m.text}</div>}
           </div>)}
-          {loading&&<div style={{background:"#f3f4f6",borderRadius:12,padding:"8px 14px",fontSize:13,color:"#9ca3af",alignSelf:"flex-start"}}>Analysiere…</div>}
+          {loading&&<div style={{background:"#f3f4f6",borderRadius:12,padding:"8px 14px",fontSize:13,color:"#9ca3af",alignSelf:"flex-start"}}>Gemini analysiert…</div>}
         </div>}
         <div style={{display:"flex",gap:8}}>
-          <input style={{...inp,flex:1,borderRadius:24,padding:"10px 16px"}} value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&!e.shiftKey&&send()} placeholder="Ort, Google Maps Link, Flug… (Enter)" disabled={loading}/>
+          <input style={{...inp,flex:1,borderRadius:24,padding:"10px 16px"}} value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&!e.shiftKey&&send()} placeholder="Ort, Flugnummer, Idee… (Enter)" disabled={loading}/>
           <button onClick={send} disabled={loading||!input.trim()} style={{...PRI,borderRadius:24,padding:"10px 18px",opacity:(!input.trim()||loading)?0.5:1}}>{loading?"…":"→"}</button>
         </div>
       </div>;
     }
 
+    // ── Forms ─────────────────────────────────────────────────────────────────
     function FlightForm({initial,onSave,onClose}){
       const init={flightNumber:"",date:"",airline:"",from:"",to:"",dep:"",arr:"",dur:"",aircraft:"",layover:"",status:"scheduled",note:""};
       const [f,setF]=useState(initial?{...init,...initial}:init);
@@ -223,10 +203,10 @@ WICHTIG: Kein date/time bei activities/restaurants außer explizit genannt. Stad
         if(FLIGHT_DB[fn]){setF(p=>({...p,...FLIGHT_DB[fn],flightNumber:fn}));setMsg("Daten geladen.");return;}
         setLoading(true);setMsg("");
         try{
-          const data=await callProxy({model:"claude-sonnet-4-20250514",max_tokens:400,messages:[{role:"user",content:`Return ONLY raw JSON for flight ${fn} on ${f.date||"2026-05-12"}. Fields: airline,from,to,dep,arr,dur,aircraft,status,layover.`}]});
-          const txt=(data.content?.find(b=>b.type==="text")?.text||"").replace(/```json?|```/g,"").trim();
-          setF(p=>({...p,...JSON.parse(txt)}));setMsg("Flugdaten geladen.");
-        }catch{setMsg("Nicht gefunden – bitte manuell ausfüllen.");}
+          const parsed=await callAI(`Gib mir nur die Flugdaten für Flug ${fn} am ${f.date||"12.05.2026"} als JSON mit Feldern: airline, from, to, dep, arr, dur, aircraft, status, layover. Nur das JSON-Objekt, kein Text.`,[]);
+          if(parsed.actions?.[0]?.data) setF(p=>({...p,...parsed.actions[0].data}));
+          setMsg("Flugdaten geladen.");
+        }catch{ setMsg("Nicht gefunden – bitte manuell ausfüllen."); }
         setLoading(false);
       };
       return <>
@@ -449,7 +429,6 @@ WICHTIG: Kein date/time bei activities/restaurants außer explizit genannt. Stad
       const openPanel=(type,item=null)=>setPanel({type,item});
       const promote=act=>{ setTab("days"); setTimeout(()=>openPanel("dayentry",{title:act.name,tag:act.tag,linkedId:act.id,note:act.note||""}),50); };
 
-      // ── BIDIRECTIONAL: dayentry → also creates activity if no linkedId
       const saveDayEntry=(entry)=>{
         const id=entry.id||Date.now();
         const newEntry={...entry,id};
@@ -468,7 +447,6 @@ WICHTIG: Kein date/time bei activities/restaurants außer explizit genannt. Stad
         setPanel(null);
       };
 
-      // ── APPLY AI ACTIONS (also bidirectional)
       const applyActions=(actions)=>{
         let next={...data};
         const actTags=["temple","nature","shopping","culture","transport","food"];
@@ -482,7 +460,7 @@ WICHTIG: Kein date/time bei activities/restaurants außer explizit genannt. Stad
             if(actTags.includes(a.data.tag)&&a.data.title){
               const actId=id+0.5;
               const city=TRIP_DAYS[a.data.dayId]?.city||"Tokyo";
-              const act={id:actId,name:a.data.title,city,tag:a.data.tag,note:a.data.note||"",address:"",lat:"",lng:"",openHours:"",closedDay:"",priceJPY:"",priceEUR:"",_fromDay:id};
+              const act={id:actId,name:a.data.title,city,tag:a.data.tag,note:a.data.note||"",address:"",lat:"",lng:"",openHours:"",closedDay:"",priceJPY:"",priceEUR:""};
               next={...next,activities:[...(next.activities||[]),act],days:[...(next.days||[]),{...a.data,id,linkedId:actId}]};
             } else {
               next={...next,days:[...(next.days||[]),{...a.data,id}]};
@@ -521,8 +499,8 @@ WICHTIG: Kein date/time bei activities/restaurants außer explizit genannt. Stad
             </div>
           </div>}
           {tab==="flights"&&<div>
-            {panel?.type==="flight"&&<Panel title={panel.item?.id?"Flug bearbeiten":"Flug hinzufügen"} onClose={()=>setPanel(null)}><FlightForm initial={panel.item} onSave={f=>upsert("flights",f)} onClose={()=>setPanel(null)}/></Panel>}
-            {(data.flights||[]).length===0&&!panel&&<div style={{textAlign:"center",padding:"3rem 1rem",color:"#9ca3af"}}><div style={{fontSize:36,marginBottom:10}}>✈</div><div style={{fontSize:13}}>Noch keine Flüge. Im KI-Assistenten „CX570 am 12. Mai" eingeben.</div></div>}
+            {panel?.type==="flight"&&<Panel title={panel.item?.id?"Bearbeiten":"Hinzufügen"} onClose={()=>setPanel(null)}><FlightForm initial={panel.item} onSave={f=>upsert("flights",f)} onClose={()=>setPanel(null)}/></Panel>}
+            {(data.flights||[]).length===0&&!panel&&<div style={{textAlign:"center",padding:"3rem 1rem",color:"#9ca3af"}}><div style={{fontSize:36,marginBottom:10}}>✈</div><div style={{fontSize:13}}>Im KI-Assistenten „CX570 am 12. Mai" eingeben.</div></div>}
             {(data.flights||[]).map(f=><FlightCard key={f.id} f={f} onEdit={x=>openPanel("flight",x)} onDelete={id=>remove("flights",id)}/>)}
             {!panel&&<button style={{...SEC,width:"100%"}} onClick={()=>openPanel("flight")}>+ Flug manuell hinzufügen</button>}
           </div>}
