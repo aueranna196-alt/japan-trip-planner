@@ -15,7 +15,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-    const { useState, useEffect, useCallback, useRef } = React;
+    const { useState, useEffect, useCallback } = React;
 
     const EUR_JPY = 162.5;
     const TRIP_START = new Date(2026, 4, 12);
@@ -55,7 +55,7 @@
     const STATUS_LABELS={scheduled:"Planmäßig",active:"Im Flug",landed:"Gelandet",delayed:"Verspätet",cancelled:"Annulliert"};
     const STATUS_COLORS={scheduled:{bg:"#dbeafe",color:"#1e3a8a"},active:{bg:"#d1fae5",color:"#064e3b"},landed:{bg:"#f1f5f9",color:"#334155"},delayed:{bg:"#fef3c7",color:"#78350f"},cancelled:{bg:"#fee2e2",color:"#7f1d1d"}};
 
-    const STORAGE_KEY = "japan2026_v7";
+    const STORAGE_KEY = "japan2026_v8";
     const blank = () => ({ flights:[], hotels:[], restaurants:[], activities:[], days:[], docs:[], lastSync:null });
 
     async function sharedLoad(){ try{ const r=await window.storage.get(STORAGE_KEY,true); return r?JSON.parse(r.value):null; }catch{ return null; } }
@@ -81,112 +81,47 @@
       </div>;
     }
 
-    // ── AI via Gemini (free) ──────────────────────────────────────────────────
-    const SYSTEM_PROMPT = `Du bist ein Reiseplanungs-Assistent für eine Japanreise (12.–28. Mai 2026, Städte: Osaka, Kyoto, Atami, Tokyo).
-Extrahiere strukturierte Daten und gib NUR ein JSON-Objekt zurück, KEIN Markdown, KEINE Erklärung, keine Codeblöcke.
+    // ── Claude Tip Tab ────────────────────────────────────────────────────────
+    const CLAUDE_PROMPTS = [
+      { label:"Ort recherchieren", prompt:`Ich plane eine Japan-Reise (Osaka, Kyoto, Atami, Tokyo, 12.–28. Mai 2026). Gib mir für folgenden Ort kompakte Infos zum Eintragen in meinen Planer – Name, Adresse, GPS-Koordinaten, Öffnungszeiten, Ruhetag, Eintrittspreis in JPY, Kategorie (temple/nature/shopping/culture/food/transport):\n\n[ORT HIER EINGEBEN]` },
+      { label:"Restaurant finden", prompt:`Empfiehl mir ein gutes Restaurant in [STADT] für [ANLASS]. Gib mir: Name, Adresse, GPS-Koordinaten, Öffnungszeiten, Ruhetag, typischer Preis pro Person in JPY, Reservierung nötig ja/nein.` },
+      { label:"Tagesplan erstellen", prompt:`Erstelle mir einen Tagesplan für [DATUM] in [STADT]. Ich möchte [INTERESSEN]. Nenne: Uhrzeit, Ort, Kategorie (temple/nature/culture/food/shopping), kurze Notiz. Kompakt und realistisch.` },
+      { label:"Flugnummer nachschlagen", prompt:`Gib mir die Flugdetails für Flug [FLUGNUMMER] am [DATUM]: Airline, Abflughafen, Zielflughafen, Abflugzeit, Ankunftszeit, Flugdauer, Flugzeugtyp, Zwischenstopp falls vorhanden.` },
+      { label:"Hotel-Infos", prompt:`Gib mir kompakte Infos zu folgendem Hotel in Japan – Name, Adresse, GPS-Koordinaten, übliche Check-in/Check-out-Zeit, typischer Preis pro Nacht in JPY:\n\n[HOTEL NAME]` },
+    ];
 
-Reise-Tage (dayId 0-16): 0=12.Mai(Osaka),1=13.Mai(Osaka),2=14.Mai(Osaka),3=15.Mai(Osaka),4=16.Mai(Kyoto),5=17.Mai(Kyoto),6=18.Mai(Kyoto),7=19.Mai(Atami),8=20.Mai(Atami),9=21.Mai(Tokyo),10=22.Mai(Tokyo),11=23.Mai(Tokyo),12=24.Mai(Tokyo),13=25.Mai(Tokyo),14=26.Mai(Tokyo),15=27.Mai(Tokyo),16=28.Mai(Abreise)
-
-Tags: food, temple, nature, shopping, culture, transport, hotel, flight
-
-Antwortformat (NUR dieses JSON, nichts sonst):
-{"message":"Kurze Bestätigung auf Deutsch","actions":[{"type":"activity|restaurant|hotel|flight|dayentry","data":{...}}]}
-
-Felder je Typ:
-- activity: name, city, tag, address, lat(string), lng(string), openHours, closedDay, priceJPY, note
-- restaurant: name, city, address, lat(string), lng(string), openHours, closedDay, priceJPY, note, reserved(false)
-- hotel: name, city, address, lat(string), lng(string), checkin, checkout, nights, priceJPY, note
-- flight: flightNumber, airline, from, to, dep, arr, dur, aircraft, status(scheduled), layover, date, note
-- dayentry: title, dayId(0-16), time, tag, note
-
-Regeln:
-- Kein date/time bei activities/restaurants außer explizit genannt
-- Stadt aus Kontext ableiten: Fushimi Inari→Kyoto, Dotonbori→Osaka, Senso-ji→Tokyo, Shibuya→Tokyo, Arashiyama→Kyoto
-- Lat/Lng als String z.B. "35.6762"
-- Bekannte Koordinaten direkt angeben, nicht erfinden
-- Bei mehreren Orten: mehrere actions
-- CX=Cathay Pacific, LH=Lufthansa, NH=ANA`;
-
-    async function callAI(userMessage, history) {
-      const res = await fetch("/api/proxy", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ systemPrompt: SYSTEM_PROMPT, userMessage, history }),
-      });
-      if (!res.ok) {
-        const e = await res.json().catch(()=>({}));
-        throw new Error(e.error || `HTTP ${res.status}`);
-      }
-      const { text } = await res.json();
-      // Parse JSON from response (strip markdown fences if present)
-      const clean = text.replace(/```json?|```/g,"").trim();
-      const match = clean.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error("Keine gültige Antwort erhalten");
-      const parsed = JSON.parse(match[0]);
-      if (!parsed.message || !Array.isArray(parsed.actions)) throw new Error("Unerwartetes Antwortformat");
-      return parsed;
-    }
-
-    function AIAssistant({data, onApply}){
-      const [input,setInput]=useState("");
-      const [loading,setLoading]=useState(false);
-      const [history,setHistory]=useState([]);
-      const [chatLog,setChatLog]=useState([]);
-      const chatRef=useRef();
-
-      const examples=["Fushimi Inari Taisha, Kyoto","Ichiran Ramen Dotonbori, Osaka","Flug CX570 am 12. Mai","TeamLab Planets Tokyo, 25€","Tsukiji Outer Market, Tokyo","Arashiyama Bambushain, Kyoto"];
-
-      const send=async()=>{
-        if(!input.trim()||loading) return;
-        const msg=input.trim(); setInput(""); setLoading(true);
-        setChatLog(l=>[...l,{role:"user",text:msg}]);
-        try{
-          const parsed=await callAI(msg,history);
-          setHistory(h=>[...h,{role:"user",content:msg},{role:"assistant",content:JSON.stringify(parsed)}]);
-          setChatLog(l=>[...l,{role:"assistant",text:parsed.message,actions:parsed.actions}]);
-        }catch(e){
-          setChatLog(l=>[...l,{role:"assistant",text:`❌ ${e.message}`,actions:[]}]);
-        }
-        setLoading(false);
-        setTimeout(()=>{ if(chatRef.current) chatRef.current.scrollTop=chatRef.current.scrollHeight; },100);
+    function ClaudeTab(){
+      const [copied, setCopied] = useState(null);
+      const copy = (text, i) => {
+        navigator.clipboard.writeText(text).then(()=>{ setCopied(i); setTimeout(()=>setCopied(null), 2000); });
       };
-
-      const apply=actions=>{ onApply(actions); setChatLog(l=>[...l,{role:"system",text:`✓ ${actions.length} Eintrag${actions.length>1?"e":""} gespeichert.`}]); };
-      const typeLabel=t=>({activity:"Aktivität",restaurant:"Restaurant",hotel:"Unterkunft",flight:"Flug",dayentry:"Tageseintrag"})[t]||t;
-
-      return <div style={{display:"flex",flexDirection:"column",gap:12}}>
-        <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:12,padding:"14px 16px"}}>
-          <div style={{fontWeight:500,fontSize:14,color:"#14532d",marginBottom:4}}>KI-Assistent · Kostenlos via Google Gemini</div>
-          <div style={{fontSize:12,color:"#166534",lineHeight:1.6}}>Ortsnamen, Flugnummern oder Ideen eingeben – Gemini erkennt alles automatisch.</div>
+      return <div>
+        <div style={{background:"#faf5ff",border:"1px solid #e9d5ff",borderRadius:12,padding:"16px 18px",marginBottom:16}}>
+          <div style={{fontWeight:500,fontSize:14,color:"#581c87",marginBottom:8}}>So nutzt du Claude als Recherche-Assistent</div>
+          <div style={{fontSize:13,color:"#6b21a8",lineHeight:1.7}}>
+            Öffne <a href="https://claude.ai" target="_blank" rel="noopener noreferrer" style={{color:"#7c3aed",fontWeight:500}}>claude.ai</a> im Browser, kopiere einen der Prompts unten, fülle die Lücken aus – und trag die Antwort dann hier manuell ein. Dauert ca. 30 Sekunden pro Ort.
+          </div>
         </div>
-        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{examples.map((e,i)=><button key={i} onClick={()=>setInput(e)} style={{background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:20,padding:"4px 11px",fontSize:11,color:"#6b7280",cursor:"pointer",fontFamily:"inherit"}}>{e}</button>)}</div>
-        {chatLog.length>0&&<div ref={chatRef} style={{maxHeight:320,overflowY:"auto",display:"flex",flexDirection:"column",gap:8}}>
-          {chatLog.map((m,i)=><div key={i} style={{display:"flex",flexDirection:"column",alignItems:m.role==="user"?"flex-end":"flex-start"}}>
-            {m.role==="user"&&<div style={{background:"#111827",color:"#fff",borderRadius:"12px 12px 2px 12px",padding:"8px 13px",fontSize:13,maxWidth:"80%"}}>{m.text}</div>}
-            {m.role==="assistant"&&<div style={{maxWidth:"90%"}}>
-              <div style={{background:"#fff",border:"1px solid #e5e7eb",borderRadius:"2px 12px 12px 12px",padding:"8px 13px",fontSize:13,color:"#111827",marginBottom:6}}>{m.text}</div>
-              {m.actions?.length>0&&<div style={{display:"flex",flexDirection:"column",gap:6}}>
-                {m.actions.map((a,j)=>{const tag=tagOf(a.data?.tag);return <div key={j} style={{background:"#f9fafb",border:`1px solid ${tag.border}40`,borderRadius:10,padding:"8px 12px"}}>
-                  <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:3}}>
-                    <span style={{fontSize:14}}>{tag.emoji}</span>
-                    <span style={{fontWeight:500,fontSize:13}}>{a.data?.name||a.data?.title||a.data?.flightNumber}</span>
-                    <span style={{fontSize:11,padding:"1px 7px",borderRadius:999,background:"#f3f4f6",color:"#6b7280"}}>{typeLabel(a.type)}</span>
-                    {a.data?.city&&<CityBadge city={a.data.city}/>}
-                  </div>
-                  {a.data?.openHours&&<div style={{fontSize:11,color:"#059669"}}>⏰ {a.data.openHours}</div>}
-                  {a.data?.priceJPY&&<div style={{fontSize:11,color:"#6b7280"}}>¥{Number(a.data.priceJPY).toLocaleString()}</div>}
-                  {a.data?.note&&<div style={{fontSize:11,color:"#9ca3af",marginTop:2}}>{a.data.note}</div>}
-                </div>;})}
-                <button onClick={()=>apply(m.actions)} style={{...PRI,fontSize:12,padding:"6px 14px",alignSelf:"flex-start"}}>✓ {m.actions.length} Eintrag{m.actions.length>1?"e":""} speichern</button>
-              </div>}
-            </div>}
-            {m.role==="system"&&<div style={{fontSize:12,color:"#059669",padding:"4px 0",alignSelf:"center"}}>{m.text}</div>}
-          </div>)}
-          {loading&&<div style={{background:"#f3f4f6",borderRadius:12,padding:"8px 14px",fontSize:13,color:"#9ca3af",alignSelf:"flex-start"}}>Gemini analysiert…</div>}
-        </div>}
-        <div style={{display:"flex",gap:8}}>
-          <input style={{...inp,flex:1,borderRadius:24,padding:"10px 16px"}} value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&!e.shiftKey&&send()} placeholder="Ort, Flugnummer, Idee… (Enter)" disabled={loading}/>
-          <button onClick={send} disabled={loading||!input.trim()} style={{...PRI,borderRadius:24,padding:"10px 18px",opacity:(!input.trim()||loading)?0.5:1}}>{loading?"…":"→"}</button>
+
+        <div style={{fontSize:12,fontWeight:500,color:"#6b7280",marginBottom:10,textPtransform:"uppercase",letterSpacing:".04em"}}>VORLAGEN — klicken zum Kopieren</div>
+
+        <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:20}}>
+          {CLAUDE_PROMPTS.map((p,i)=>(
+            <div key={i} style={{...card,marginBottom:0,cursor:"pointer"}} onClick={()=>copy(p.prompt,i)}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:13,fontWeight:500,color:"#111827"}}>{p.label}</span>
+                <span style={{fontSize:12,color:copied===i?"#059669":"#9ca3af",fontWeight:copied===i?500:400,transition:"color .2s"}}>
+                  {copied===i?"✓ Kopiert!":"Kopieren"}
+                </span>
+              </div>
+              <div style={{fontSize:12,color:"#9ca3af",marginTop:4,lineHeight:1.5,whiteSpace:"pre-wrap"}}>{p.prompt.slice(0,120)}…</div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:12,padding:"14px 16px"}}>
+          <div style={{fontWeight:500,fontSize:13,color:"#14532d",marginBottom:6}}>Tipp: Google Maps Links</div>
+          <div style={{fontSize:13,color:"#166534",lineHeight:1.6}}>Kopiere einfach einen Google Maps Link und schreibe an Claude: <em>"Gib mir die Infos zu diesem Ort für meinen Japan-Reiseplaner: [LINK]"</em> – Claude sucht alles heraus.</div>
         </div>
       </div>;
     }
@@ -195,37 +130,36 @@ Regeln:
     function FlightForm({initial,onSave,onClose}){
       const init={flightNumber:"",date:"",airline:"",from:"",to:"",dep:"",arr:"",dur:"",aircraft:"",layover:"",status:"scheduled",note:""};
       const [f,setF]=useState(initial?{...init,...initial}:init);
-      const [loading,setLoading]=useState(false);
       const [msg,setMsg]=useState("");
       const set=(k,v)=>setF(p=>({...p,[k]:v}));
-      const lookup=async()=>{
+      const lookup=()=>{
         const fn=f.flightNumber.toUpperCase().replace(/\s/g,"");
-        if(FLIGHT_DB[fn]){setF(p=>({...p,...FLIGHT_DB[fn],flightNumber:fn}));setMsg("Daten geladen.");return;}
-        setLoading(true);setMsg("");
-        try{
-          const parsed=await callAI(`Gib mir nur die Flugdaten für Flug ${fn} am ${f.date||"12.05.2026"} als JSON mit Feldern: airline, from, to, dep, arr, dur, aircraft, status, layover. Nur das JSON-Objekt, kein Text.`,[]);
-          if(parsed.actions?.[0]?.data) setF(p=>({...p,...parsed.actions[0].data}));
-          setMsg("Flugdaten geladen.");
-        }catch{ setMsg("Nicht gefunden – bitte manuell ausfüllen."); }
-        setLoading(false);
+        if(FLIGHT_DB[fn]){setF(p=>({...p,...FLIGHT_DB[fn],flightNumber:fn}));setMsg("Daten geladen.");}
+        else setMsg("Nicht in Datenbank – bitte manuell ausfüllen.");
       };
       return <>
-        <div style={{display:"flex",gap:8}}><F label="Flugnummer" half><input style={inp} value={f.flightNumber} onChange={e=>set("flightNumber",e.target.value.toUpperCase())} placeholder="CX570"/></F><F label="Datum" half><input style={inp} type="date" value={f.date} onChange={e=>set("date",e.target.value)}/></F></div>
-        <button onClick={lookup} disabled={loading} style={{...PRI,width:"100%",marginBottom:8,opacity:loading?0.65:1}}>{loading?"Lade…":"Flugdaten automatisch laden"}</button>
+        <div style={{display:"flex",gap:8}}>
+          <F label="Flugnummer" half><input style={inp} value={f.flightNumber} onChange={e=>set("flightNumber",e.target.value.toUpperCase())} placeholder="CX570"/></F>
+          <F label="Datum" half><input style={inp} type="date" value={f.date} onChange={e=>set("date",e.target.value)}/></F>
+        </div>
+        <button onClick={lookup} style={{...PRI,width:"100%",marginBottom:8}}>Aus Datenbank laden</button>
         {msg&&<div style={{fontSize:12,color:"#6b7280",marginBottom:10,textAlign:"center"}}>{msg}</div>}
         <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
           <F label="Airline" half><input style={inp} value={f.airline} onChange={e=>set("airline",e.target.value)}/></F>
           <F label="Status" half><select style={inp} value={f.status} onChange={e=>set("status",e.target.value)}>{Object.entries(STATUS_LABELS).map(([k,v])=><option key={k} value={k}>{v}</option>)}</select></F>
-          <F label="Von" half><input style={inp} value={f.from} onChange={e=>set("from",e.target.value)}/></F>
-          <F label="Nach" half><input style={inp} value={f.to} onChange={e=>set("to",e.target.value)}/></F>
+          <F label="Von" half><input style={inp} value={f.from} onChange={e=>set("from",e.target.value)} placeholder="Frankfurt (FRA)"/></F>
+          <F label="Nach" half><input style={inp} value={f.to} onChange={e=>set("to",e.target.value)} placeholder="Osaka (KIX)"/></F>
           <F label="Abflug" half><input style={inp} value={f.dep} onChange={e=>set("dep",e.target.value)} placeholder="21:25"/></F>
           <F label="Ankunft" half><input style={inp} value={f.arr} onChange={e=>set("arr",e.target.value)} placeholder="15:45+1"/></F>
           <F label="Dauer" half><input style={inp} value={f.dur} onChange={e=>set("dur",e.target.value)} placeholder="11h 20m"/></F>
           <F label="Flugzeugtyp" half><input style={inp} value={f.aircraft} onChange={e=>set("aircraft",e.target.value)}/></F>
-          <F label="Zwischenstopp"><input style={inp} value={f.layover||""} onChange={e=>set("layover",e.target.value)}/></F>
+          <F label="Zwischenstopp"><input style={inp} value={f.layover||""} onChange={e=>set("layover",e.target.value)} placeholder="Hongkong (HKG) · 2h 25m"/></F>
           <F label="Notiz"><textarea style={{...inp,height:48,resize:"vertical"}} value={f.note||""} onChange={e=>set("note",e.target.value)}/></F>
         </div>
-        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}><button style={SEC} onClick={onClose}>Abbrechen</button><button style={PRI} onClick={()=>onSave(f)}>Speichern</button></div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+          <button style={SEC} onClick={onClose}>Abbrechen</button>
+          <button style={PRI} onClick={()=>onSave(f)}>Speichern</button>
+        </div>
       </>;
     }
 
@@ -242,7 +176,11 @@ Regeln:
           <F label="Adresse"><input style={inp} value={f.address||""} onChange={e=>set("address",e.target.value)}/></F>
           <F label="Lat" half><input style={inp} value={f.lat||""} onChange={e=>set("lat",e.target.value)} placeholder="34.6937"/></F>
           <F label="Lng" half><input style={inp} value={f.lng||""} onChange={e=>set("lng",e.target.value)} placeholder="135.5023"/></F>
-          {type==="hotel"&&<><F label="Check-in" half><input type="date" style={inp} value={f.checkin||""} onChange={e=>set("checkin",e.target.value)}/></F><F label="Check-out" half><input type="date" style={inp} value={f.checkout||""} onChange={e=>set("checkout",e.target.value)}/></F><F label="Nächte" half><input style={inp} value={f.nights||""} onChange={e=>set("nights",e.target.value)}/></F></>}
+          {type==="hotel"&&<>
+            <F label="Check-in" half><input type="date" style={inp} value={f.checkin||""} onChange={e=>set("checkin",e.target.value)}/></F>
+            <F label="Check-out" half><input type="date" style={inp} value={f.checkout||""} onChange={e=>set("checkout",e.target.value)}/></F>
+            <F label="Nächte" half><input style={inp} value={f.nights||""} onChange={e=>set("nights",e.target.value)}/></F>
+          </>}
           <F label="Preis (JPY)" half><input style={inp} value={f.priceJPY||""} onChange={e=>set("priceJPY",e.target.value)} placeholder="1500"/></F>
           <F label="Preis (EUR)" half><input style={inp} value={f.priceEUR||""} onChange={e=>set("priceEUR",e.target.value)} placeholder="9"/></F>
           <F label="Öffnungszeiten" half><input style={inp} value={f.openHours||""} onChange={e=>set("openHours",e.target.value)} placeholder="09:00–17:00"/></F>
@@ -250,7 +188,10 @@ Regeln:
           <F label="Notiz"><textarea style={{...inp,height:52,resize:"vertical"}} value={f.note||""} onChange={e=>set("note",e.target.value)}/></F>
           {type==="restaurant"&&<div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}><input type="checkbox" id="res" checked={!!f.reserved} onChange={e=>set("reserved",e.target.checked)}/><label htmlFor="res" style={{fontSize:13,color:"#374151"}}>Reservierung gemacht</label></div>}
         </div>
-        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}><button style={SEC} onClick={onClose}>Abbrechen</button><button style={PRI} onClick={()=>f.name.trim()&&onSave(f)}>Speichern</button></div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+          <button style={SEC} onClick={onClose}>Abbrechen</button>
+          <button style={PRI} onClick={()=>f.name.trim()&&onSave(f)}>Speichern</button>
+        </div>
       </>;
     }
 
@@ -267,10 +208,14 @@ Regeln:
         <F label="Kategorie"><select style={inp} value={f.tag} onChange={e=>set("tag",e.target.value)}>{TAGS.map(t=><option key={t.id} value={t.id}>{t.emoji} {t.label}</option>)}</select></F>
         <F label="Ort verknüpfen (optional)"><select style={inp} value={f.linkedId||""} onChange={e=>set("linkedId",e.target.value||"")}><option value="">— keinen —</option>{linkable.map(x=><option key={x.id} value={x.id}>{x.name} · {x.city}</option>)}</select></F>
         <F label="Notiz"><textarea style={{...inp,height:52,resize:"vertical"}} value={f.note||""} onChange={e=>set("note",e.target.value)}/></F>
-        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}><button style={SEC} onClick={onClose}>Abbrechen</button><button style={PRI} onClick={()=>f.title.trim()&&onSave(f)}>Speichern</button></div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+          <button style={SEC} onClick={onClose}>Abbrechen</button>
+          <button style={PRI} onClick={()=>f.title.trim()&&onSave(f)}>Speichern</button>
+        </div>
       </>;
     }
 
+    // ── Timeline ──────────────────────────────────────────────────────────────
     function Timeline({dayId,data,onAdd,onRemove}){
       const day=TRIP_DAYS[dayId]; const all=[];
       (data.flights||[]).forEach(f=>{
@@ -314,6 +259,7 @@ Regeln:
       </div>;
     }
 
+    // ── Map Tab ───────────────────────────────────────────────────────────────
     const GMAPS_URL="https://www.google.com/maps/d/u/0/edit?mid=1U1lAjQ0NX7HycdQfr9S6jmIKgh3RU3U&usp=sharing";
     function MapTab({data,filterTag}){
       const places=[...(data.hotels||[]).map(h=>({...h,emoji:"🏨",_tag:"hotel"})),...(data.restaurants||[]).map(r=>({...r,emoji:"🍜",_tag:r.tag})),...(data.activities||[]).map(a=>({...a,emoji:tagOf(a.tag).emoji,_tag:a.tag}))].filter(p=>!filterTag||p.tag===filterTag||p._tag===filterTag);
@@ -322,21 +268,30 @@ Regeln:
           <div style={{fontWeight:500,fontSize:13,color:"#1e40af",marginBottom:6}}>🗺 Google My Maps</div>
           <a href={GMAPS_URL} target="_blank" rel="noopener noreferrer" style={{...PRI,textDecoration:"none",display:"inline-block",fontSize:12}}>Karte öffnen ↗</a>
         </div>
-        {CITIES.map(city=>{const pts=places.filter(p=>p.city===city);if(!pts.length)return null;const cs=cityOf(city);return <div key={city} style={{marginBottom:16}}>
-          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><span style={{fontWeight:500,fontSize:14}}>{city}</span><span style={{fontSize:11,background:cs.bg,color:cs.text,padding:"1px 7px",borderRadius:999}}>{pts.length} Orte</span><div style={{flex:1,height:1,background:"#f3f4f6"}}/></div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:8}}>
-            {pts.map((p,i)=><div key={i} style={{background:"#fff",border:`1px solid ${cs.border}30`,borderRadius:10,padding:"10px 12px"}}>
-              <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><span style={{fontWeight:500,fontSize:13}}>{p.emoji} {p.name}</span><MapBtn name={p.name} lat={p.lat} lng={p.lng}/></div>
-              {p.address&&<div style={{fontSize:11,color:"#9ca3af"}}>{p.address}</div>}
-              {p.openHours&&<div style={{fontSize:11,color:"#059669",marginTop:3}}>⏰ {p.openHours}</div>}
-              {(p.priceJPY||p.priceEUR)&&<div style={{marginTop:4}}><PriceTag jpy={p.priceJPY} eur={p.priceEUR}/></div>}
-            </div>)}
-          </div>
-        </div>;})}
+        {CITIES.map(city=>{
+          const pts=places.filter(p=>p.city===city); if(!pts.length)return null;
+          const cs=cityOf(city);
+          return <div key={city} style={{marginBottom:16}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+              <span style={{fontWeight:500,fontSize:14}}>{city}</span>
+              <span style={{fontSize:11,background:cs.bg,color:cs.text,padding:"1px 7px",borderRadius:999}}>{pts.length} Orte</span>
+              <div style={{flex:1,height:1,background:"#f3f4f6"}}/>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:8}}>
+              {pts.map((p,i)=><div key={i} style={{background:"#fff",border:`1px solid ${cs.border}30`,borderRadius:10,padding:"10px 12px"}}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><span style={{fontWeight:500,fontSize:13}}>{p.emoji} {p.name}</span><MapBtn name={p.name} lat={p.lat} lng={p.lng}/></div>
+                {p.address&&<div style={{fontSize:11,color:"#9ca3af"}}>{p.address}</div>}
+                {p.openHours&&<div style={{fontSize:11,color:"#059669",marginTop:3}}>⏰ {p.openHours}</div>}
+                {(p.priceJPY||p.priceEUR)&&<div style={{marginTop:4}}><PriceTag jpy={p.priceJPY} eur={p.priceEUR}/></div>}
+              </div>)}
+            </div>
+          </div>;
+        })}
         {places.length===0&&<div style={{textAlign:"center",color:"#9ca3af",padding:"2rem",fontSize:13}}>Noch keine Orte gespeichert.</div>}
       </div>;
     }
 
+    // ── Currency Tab ──────────────────────────────────────────────────────────
     function CurrencyTab(){
       const [jpy,setJpy]=useState("");const [eur,setEur]=useState("");
       const fromJ=v=>{setJpy(v);setEur(v?(v/EUR_JPY).toFixed(2):"");};
@@ -351,7 +306,9 @@ Regeln:
             <div style={{paddingBottom:10,fontSize:18,color:"#9ca3af",flexShrink:0}}>⇄</div>
             <F label="Euro (€)"><input style={inp} type="number" value={eur} onChange={e=>fromE(e.target.value)} placeholder="9.23"/></F>
           </div>
-          <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:8}}>{presets.map(([y,l])=><button key={y} onClick={()=>fromJ(y)} style={{background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:6,padding:"3px 9px",cursor:"pointer",fontSize:11,color:"#6b7280",fontFamily:"inherit"}}>¥{Number(y).toLocaleString()} ({l})</button>)}</div>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:8}}>
+            {presets.map(([y,l])=><button key={y} onClick={()=>fromJ(y)} style={{background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:6,padding:"3px 9px",cursor:"pointer",fontSize:11,color:"#6b7280",fontFamily:"inherit"}}>¥{Number(y).toLocaleString()} ({l})</button>)}
+          </div>
         </div>
         <div style={card}>
           <div style={{fontWeight:500,fontSize:14,marginBottom:10}}>Typische Kosten</div>
@@ -360,6 +317,7 @@ Regeln:
       </div>;
     }
 
+    // ── Docs Tab ──────────────────────────────────────────────────────────────
     function DocsTab({docs,onAdd,onDelete}){
       const [open,setOpen]=useState(false);
       const [form,setForm]=useState({name:"",type:"ticket",dayId:"",note:"",dataURL:""});
@@ -381,10 +339,26 @@ Regeln:
           <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><button style={SEC} onClick={()=>setOpen(false)}>Abbrechen</button><button style={PRI} onClick={()=>{if(form.name.trim()){onAdd(form);setOpen(false);setForm({name:"",type:"ticket",dayId:"",note:"",dataURL:""});}}}>Speichern</button></div>
         </Panel>}
         {(docs||[]).length===0&&!open&&<div style={{textAlign:"center",color:"#9ca3af",padding:"2rem",fontSize:13}}>Noch keine Dokumente gespeichert.</div>}
-        {(docs||[]).map(d=>{const day=d.dayId!==""&&d.dayId!=null?TRIP_DAYS[d.dayId]:null;const ico=DOC_TYPES[d.type]?.split(" ")[0]||"📎";return <div key={d.id} style={{...card,display:"flex",alignItems:"center",gap:12}}><div style={{fontSize:24,flexShrink:0}}>{ico}</div><div style={{flex:1,minWidth:0}}><div style={{fontWeight:500,fontSize:13}}>{d.name}</div><div style={{fontSize:12,color:"#6b7280",marginTop:3}}>{DOC_TYPES[d.type]||d.type}{day&&<span> · 📅 {day.label}</span>}</div>{d.note&&<div style={{fontSize:12,color:"#9ca3af",marginTop:3}}>{d.note}</div>}</div><div style={{display:"flex",gap:6,flexShrink:0}}>{d.dataURL&&<button onClick={()=>setPreview(d.dataURL)} style={{...SEC,fontSize:12,padding:"4px 10px"}}>Ansehen</button>}<button onClick={()=>onDelete(d.id)} style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:13}}>✕</button></div></div>;})}
+        {(docs||[]).map(d=>{
+          const day=d.dayId!==""&&d.dayId!=null?TRIP_DAYS[d.dayId]:null;
+          const ico=DOC_TYPES[d.type]?.split(" ")[0]||"📎";
+          return <div key={d.id} style={{...card,display:"flex",alignItems:"center",gap:12}}>
+            <div style={{fontSize:24,flexShrink:0}}>{ico}</div>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontWeight:500,fontSize:13}}>{d.name}</div>
+              <div style={{fontSize:12,color:"#6b7280",marginTop:3}}>{DOC_TYPES[d.type]||d.type}{day&&<span> · 📅 {day.label}</span>}</div>
+              {d.note&&<div style={{fontSize:12,color:"#9ca3af",marginTop:3}}>{d.note}</div>}
+            </div>
+            <div style={{display:"flex",gap:6,flexShrink:0}}>
+              {d.dataURL&&<button onClick={()=>setPreview(d.dataURL)} style={{...SEC,fontSize:12,padding:"4px 10px"}}>Ansehen</button>}
+              <button onClick={()=>onDelete(d.id)} style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:13}}>✕</button>
+            </div>
+          </div>;
+        })}
       </div>;
     }
 
+    // ── Flight Card ───────────────────────────────────────────────────────────
     function FlightCard({f,onEdit,onDelete}){
       const st=STATUS_COLORS[f.status]||STATUS_COLORS.scheduled;
       return <div style={{...card,borderLeft:"3px solid #0ea5e9"}}>
@@ -409,10 +383,21 @@ Regeln:
       </div>;
     }
 
-    const TABS=[{id:"ai",label:"✨ KI-Assistent"},{id:"days",label:"📅 Tagesplanung"},{id:"flights",label:"✈ Flüge"},{id:"hotels",label:"🏨 Unterkünfte"},{id:"rests",label:"🍜 Restaurants"},{id:"acts",label:"🗂 Aktivitäten"},{id:"map",label:"🗺 Karte"},{id:"currency",label:"💱 Währung"},{id:"docs",label:"📎 Dokumente"}];
+    // ── MAIN ─────────────────────────────────────────────────────────────────
+    const TABS=[
+      {id:"claude", label:"✨ Claude-Tipps"},
+      {id:"days",   label:"📅 Tagesplanung"},
+      {id:"flights",label:"✈ Flüge"},
+      {id:"hotels", label:"🏨 Unterkünfte"},
+      {id:"rests",  label:"🍜 Restaurants"},
+      {id:"acts",   label:"🗂 Aktivitäten"},
+      {id:"map",    label:"🗺 Karte"},
+      {id:"currency",label:"💱 Währung"},
+      {id:"docs",   label:"📎 Dokumente"},
+    ];
 
     function App(){
-      const [tab,setTab]=useState("ai");
+      const [tab,setTab]=useState("claude");
       const [data,setData]=useState(blank());
       const [panel,setPanel]=useState(null);
       const [selDay,setSelDay]=useState(0);
@@ -447,29 +432,6 @@ Regeln:
         setPanel(null);
       };
 
-      const applyActions=(actions)=>{
-        let next={...data};
-        const actTags=["temple","nature","shopping","culture","transport","food"];
-        actions.forEach(a=>{
-          const id=Date.now()+Math.random();
-          if(a.type==="activity") next={...next,activities:[...(next.activities||[]),{...a.data,id}]};
-          else if(a.type==="restaurant") next={...next,restaurants:[...(next.restaurants||[]),{...a.data,id}]};
-          else if(a.type==="hotel") next={...next,hotels:[...(next.hotels||[]),{...a.data,id}]};
-          else if(a.type==="flight") next={...next,flights:[...(next.flights||[]),{...a.data,id}]};
-          else if(a.type==="dayentry"){
-            if(actTags.includes(a.data.tag)&&a.data.title){
-              const actId=id+0.5;
-              const city=TRIP_DAYS[a.data.dayId]?.city||"Tokyo";
-              const act={id:actId,name:a.data.title,city,tag:a.data.tag,note:a.data.note||"",address:"",lat:"",lng:"",openHours:"",closedDay:"",priceJPY:"",priceEUR:""};
-              next={...next,activities:[...(next.activities||[]),act],days:[...(next.days||[]),{...a.data,id,linkedId:actId}]};
-            } else {
-              next={...next,days:[...(next.days||[]),{...a.data,id}]};
-            }
-          }
-        });
-        save(next);
-      };
-
       const tabBtn=active=>({padding:"6px 12px",borderRadius:8,border:active?"1.5px solid #111827":"1px solid #e5e7eb",background:active?"#111827":"#fff",color:active?"#fff":"#6b7280",cursor:"pointer",fontSize:12,fontWeight:active?500:400,whiteSpace:"nowrap",fontFamily:"inherit"});
 
       return <div style={{fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",color:"#111827",background:"#f9fafb",minHeight:"100vh",fontSize:14}}>
@@ -479,15 +441,19 @@ Regeln:
           <div style={{flex:1}}/>
           <div style={{fontSize:11,fontWeight:500,color:syncing?"#d97706":syncOk?"#059669":"#9ca3af"}}>{syncing?"⟳ Sync…":syncOk?"✓ Gespeichert":"Cloud-Sync aktiv"}</div>
         </div>
+
         <div style={{background:"#fff",borderBottom:"1px solid #e5e7eb",padding:"8px 14px",display:"flex",gap:5,overflowX:"auto"}}>
           {TABS.map(t=><button key={t.id} onClick={()=>{setTab(t.id);setPanel(null);}} style={tabBtn(tab===t.id)}>{t.label}</button>)}
         </div>
+
         {(tab==="map"||tab==="acts")&&<div style={{background:"#fff",borderBottom:"1px solid #f3f4f6",padding:"7px 14px",display:"flex",gap:5,overflowX:"auto"}}>
           <button onClick={()=>setFilterTag(null)} style={{padding:"3px 10px",borderRadius:999,border:`1px solid ${!filterTag?"#111827":"#e5e7eb"}`,background:!filterTag?"#111827":"#fff",color:!filterTag?"#fff":"#6b7280",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>Alle</button>
           {TAGS.map(t=><button key={t.id} onClick={()=>setFilterTag(filterTag===t.id?null:t.id)} style={{padding:"3px 10px",borderRadius:999,border:`1px solid ${filterTag===t.id?t.border:"#e5e7eb"}`,background:filterTag===t.id?t.bg:"#fff",color:filterTag===t.id?t.color:"#6b7280",cursor:"pointer",fontSize:11,fontFamily:"inherit",whiteSpace:"nowrap"}}>{t.emoji} {t.label}</button>)}
         </div>}
+
         <div style={{padding:"14px 16px",maxWidth:780,margin:"0 auto"}}>
-          {tab==="ai"&&<div style={card}><AIAssistant data={data} onApply={applyActions}/></div>}
+          {tab==="claude"&&<ClaudeTab/>}
+
           {tab==="days"&&<div>
             <div style={{display:"flex",gap:5,overflowX:"auto",marginBottom:12,paddingBottom:2}}>
               {TRIP_DAYS.map(d=>{const cs=cityOf(d.city);const active=selDay===d.id;return <button key={d.id} onClick={()=>{setSelDay(d.id);setPanel(null);}} style={{flexShrink:0,padding:"6px 10px",borderRadius:8,border:`1px solid ${active?cs.border:"#e5e7eb"}`,background:active?cs.bg:"#fff",color:active?cs.text:"#6b7280",cursor:"pointer",fontSize:11,fontWeight:active?500:400,fontFamily:"inherit"}}>{d.label}</button>;})}
@@ -498,12 +464,14 @@ Regeln:
               <Timeline dayId={selDay} data={data} onAdd={()=>openPanel("dayentry",{dayId:selDay})} onRemove={id=>remove("days",id)}/>
             </div>
           </div>}
+
           {tab==="flights"&&<div>
             {panel?.type==="flight"&&<Panel title={panel.item?.id?"Bearbeiten":"Hinzufügen"} onClose={()=>setPanel(null)}><FlightForm initial={panel.item} onSave={f=>upsert("flights",f)} onClose={()=>setPanel(null)}/></Panel>}
-            {(data.flights||[]).length===0&&!panel&&<div style={{textAlign:"center",padding:"3rem 1rem",color:"#9ca3af"}}><div style={{fontSize:36,marginBottom:10}}>✈</div><div style={{fontSize:13}}>Im KI-Assistenten „CX570 am 12. Mai" eingeben.</div></div>}
+            {(data.flights||[]).length===0&&!panel&&<div style={{textAlign:"center",padding:"3rem 1rem",color:"#9ca3af"}}><div style={{fontSize:36,marginBottom:10}}>✈</div><div style={{fontSize:13}}>Noch keine Flüge. Bekannte Flüge (CX570 etc.) können direkt aus der Datenbank geladen werden.</div></div>}
             {(data.flights||[]).map(f=><FlightCard key={f.id} f={f} onEdit={x=>openPanel("flight",x)} onDelete={id=>remove("flights",id)}/>)}
-            {!panel&&<button style={{...SEC,width:"100%"}} onClick={()=>openPanel("flight")}>+ Flug manuell hinzufügen</button>}
+            {!panel&&<button style={{...SEC,width:"100%"}} onClick={()=>openPanel("flight")}>+ Flug hinzufügen</button>}
           </div>}
+
           {tab==="hotels"&&<div>
             {panel?.type==="hotel"&&<Panel title={panel.item?.id?"Bearbeiten":"Hinzufügen"} onClose={()=>setPanel(null)}><PlaceForm initial={panel.item} type="hotel" onSave={h=>upsert("hotels",h)} onClose={()=>setPanel(null)}/></Panel>}
             {(data.hotels||[]).map(h=>{const cs=cityOf(h.city);return <div key={h.id} style={{...card,borderLeft:`3px solid ${cs.border}`}}>
@@ -521,9 +489,10 @@ Regeln:
                 <div style={{display:"flex",gap:6,marginLeft:8,flexShrink:0}}><MapBtn name={h.name} lat={h.lat} lng={h.lng}/><button onClick={()=>openPanel("hotel",h)} style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:13,padding:0}}>✎</button><button onClick={()=>remove("hotels",h.id)} style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:13,padding:0}}>✕</button></div>
               </div>
             </div>;})}
-            {(data.hotels||[]).length===0&&!panel&&<div style={{textAlign:"center",padding:"2rem",color:"#9ca3af",fontSize:13}}>Im KI-Assistenten Hotel eingeben.</div>}
+            {(data.hotels||[]).length===0&&!panel&&<div style={{textAlign:"center",padding:"2rem",color:"#9ca3af",fontSize:13}}>Noch keine Unterkünfte eingetragen.</div>}
             {!panel&&<button style={{...SEC,width:"100%"}} onClick={()=>openPanel("hotel")}>+ Unterkunft hinzufügen</button>}
           </div>}
+
           {tab==="rests"&&<div>
             {panel?.type==="restaurant"&&<Panel title={panel.item?.id?"Bearbeiten":"Hinzufügen"} onClose={()=>setPanel(null)}><PlaceForm initial={panel.item} type="restaurant" onSave={r=>upsert("restaurants",r)} onClose={()=>setPanel(null)}/></Panel>}
             {(data.restaurants||[]).map(r=><div key={r.id} style={{...card,borderLeft:"3px solid #f59e0b"}}>
@@ -537,9 +506,10 @@ Regeln:
                 <div style={{display:"flex",gap:6,flexShrink:0,marginLeft:8}}><MapBtn name={r.name} lat={r.lat} lng={r.lng}/><button onClick={()=>openPanel("restaurant",r)} style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:13,padding:0}}>✎</button><button onClick={()=>remove("restaurants",r.id)} style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:13,padding:0}}>✕</button></div>
               </div>
             </div>)}
-            {(data.restaurants||[]).length===0&&!panel&&<div style={{textAlign:"center",padding:"2rem",color:"#9ca3af",fontSize:13}}>Im KI-Assistenten Restaurant eingeben.</div>}
+            {(data.restaurants||[]).length===0&&!panel&&<div style={{textAlign:"center",padding:"2rem",color:"#9ca3af",fontSize:13}}>Noch keine Restaurants eingetragen.</div>}
             {!panel&&<button style={{...SEC,width:"100%"}} onClick={()=>openPanel("restaurant")}>+ Restaurant hinzufügen</button>}
           </div>}
+
           {tab==="acts"&&<div>
             {panel?.type==="activity"&&<Panel title={panel.item?.id?"Bearbeiten":"Hinzufügen"} onClose={()=>setPanel(null)}><PlaceForm initial={panel.item} type="activity" onSave={a=>upsert("activities",a)} onClose={()=>setPanel(null)}/></Panel>}
             <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(185px,1fr))",gap:10,marginBottom:12}}>
@@ -551,10 +521,11 @@ Regeln:
                 {a.note&&<div style={{fontSize:11,color:"#9ca3af",marginTop:4}}>{a.note}</div>}
                 <button onClick={()=>promote(a)} style={{...SEC,width:"100%",fontSize:11,padding:"5px 0",marginTop:8}}>📅 In Tagesplan</button>
               </div>;})}
-              {(data.activities||[]).filter(a=>!filterTag||a.tag===filterTag).length===0&&<div style={{gridColumn:"1/-1",textAlign:"center",color:"#9ca3af",padding:"2rem",fontSize:13}}>Im KI-Assistenten Orte eingeben.</div>}
+              {(data.activities||[]).filter(a=>!filterTag||a.tag===filterTag).length===0&&<div style={{gridColumn:"1/-1",textAlign:"center",color:"#9ca3af",padding:"2rem",fontSize:13}}>Noch keine Aktivitäten eingetragen.</div>}
             </div>
             {!panel&&<button style={{...SEC,width:"100%"}} onClick={()=>openPanel("activity")}>+ Aktivität hinzufügen</button>}
           </div>}
+
           {tab==="map"&&<MapTab data={data} filterTag={filterTag}/>}
           {tab==="currency"&&<CurrencyTab/>}
           {tab==="docs"&&<DocsTab docs={data.docs||[]} onAdd={d=>upsert("docs",d)} onDelete={id=>remove("docs",id)}/>}
