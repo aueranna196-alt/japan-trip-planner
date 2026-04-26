@@ -15,7 +15,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-    const { useState, useEffect, useCallback } = React;
+    const { useState, useEffect, useCallback, useRef } = React;
 
     const EUR_JPY = 162.5;
     const TRIP_START = new Date(2026, 4, 12);
@@ -55,7 +55,7 @@
     const STATUS_LABELS={scheduled:"Planmäßig",active:"Im Flug",landed:"Gelandet",delayed:"Verspätet",cancelled:"Annulliert"};
     const STATUS_COLORS={scheduled:{bg:"#dbeafe",color:"#1e3a8a"},active:{bg:"#d1fae5",color:"#064e3b"},landed:{bg:"#f1f5f9",color:"#334155"},delayed:{bg:"#fef3c7",color:"#78350f"},cancelled:{bg:"#fee2e2",color:"#7f1d1d"}};
 
-    const STORAGE_KEY = "japan2026_v8";
+    const STORAGE_KEY = "japan2026_v9";
     const blank = () => ({ flights:[], hotels:[], restaurants:[], activities:[], days:[], docs:[], lastSync:null });
 
     async function sharedLoad(){ try{ const r=await window.storage.get(STORAGE_KEY,true); return r?JSON.parse(r.value):null; }catch{ return null; } }
@@ -81,47 +81,421 @@
       </div>;
     }
 
-    // ── Claude Tip Tab ────────────────────────────────────────────────────────
+    // ── PARSER ────────────────────────────────────────────────────────────────
+    // Parses the structured Claude output format into an app entry object.
+    // Returns { type, data } or null if format not recognized.
+    function parseClaudeText(raw) {
+      if (!raw || !raw.trim()) return null;
+      const lines = raw.trim().split("\n").map(l => l.trim()).filter(Boolean);
+      if (!lines.length) return null;
+
+      // First line must be a type tag: #aktivität #restaurant #hotel #flug #tag
+      const typeLine = lines[0].toLowerCase();
+      const typeMap = {
+        "#aktivität": "activity", "#aktivitaet": "activity", "#aktivitat": "activity",
+        "#restaurant": "restaurant", "#cafe": "restaurant", "#café": "restaurant",
+        "#hotel": "hotel", "#unterkunft": "hotel",
+        "#flug": "flight",
+        "#tag": "dayentry", "#tageseintrag": "dayentry",
+      };
+      const type = typeMap[typeLine];
+      if (!type) return null;
+
+      // Parse key: value lines
+      const kv = {};
+      lines.slice(1).forEach(line => {
+        const col = line.indexOf(":");
+        if (col === -1) return;
+        const key = line.slice(0, col).trim().toLowerCase()
+          .replace(/ö/g,"oe").replace(/ü/g,"ue").replace(/ä/g,"ae")
+          .replace(/\s+/g,"_");
+        const val = line.slice(col + 1).trim();
+        if (val && val !== "–" && val !== "-") kv[key] = val;
+      });
+
+      const cityNorm = v => {
+        if (!v) return "Tokyo";
+        const l = v.toLowerCase();
+        if (l.includes("osaka")) return "Osaka";
+        if (l.includes("kyoto")) return "Kyoto";
+        if (l.includes("atami")) return "Atami";
+        if (l.includes("tokyo") || l.includes("tokio")) return "Tokyo";
+        return v;
+      };
+
+      const tagNorm = v => {
+        if (!v) return "culture";
+        const l = v.toLowerCase();
+        if (l.includes("temple") || l.includes("tempel") || l.includes("schrein") || l.includes("shrine")) return "temple";
+        if (l.includes("nature") || l.includes("natur") || l.includes("park")) return "nature";
+        if (l.includes("food") || l.includes("essen") || l.includes("cafe") || l.includes("café") || l.includes("restaurant")) return "food";
+        if (l.includes("shop")) return "shopping";
+        if (l.includes("transport") || l.includes("bahn") || l.includes("zug") || l.includes("bus")) return "transport";
+        if (l.includes("hotel") || l.includes("unterkunft") || l.includes("hostel")) return "hotel";
+        if (l.includes("flight") || l.includes("flug")) return "flight";
+        return "culture";
+      };
+
+      const dayIdFromText = v => {
+        if (!v) return null;
+        // Try numeric first
+        const num = parseInt(v);
+        if (!isNaN(num) && num >= 0 && num <= 16) return num;
+        // Try to match date string like "12.05" or "12. Mai" or city+slot
+        const lower = v.toLowerCase();
+        for (let i = 0; i < TRIP_DAYS.length; i++) {
+          const d = TRIP_DAYS[i];
+          if (lower.includes(d.date) || lower.includes(d.label.toLowerCase())) return i;
+          // match "12.05" style
+          const parts = d.date.split("-");
+          if (lower.includes(`${parts[2]}.${parts[1]}`)) return i;
+        }
+        return null;
+      };
+
+      if (type === "activity") {
+        return { type: "activity", data: {
+          name: kv["name"] || "",
+          city: cityNorm(kv["stadt"] || kv["city"]),
+          tag: tagNorm(kv["kategorie"] || kv["tag"] || kv["category"]),
+          address: kv["adresse"] || kv["address"] || "",
+          lat: kv["lat"] || kv["latitude"] || "",
+          lng: kv["lng"] || kv["longitude"] || kv["lon"] || "",
+          openHours: kv["oeffnungszeiten"] || kv["oeeffnungszeiten"] || kv["opening_hours"] || kv["oeffnungszeit"] || "",
+          closedDay: kv["ruhetag"] || kv["closed"] || kv["geschlossen"] || "",
+          priceJPY: kv["preis"] || kv["preis_jpy"] || kv["eintrittspreis"] || kv["eintritt"] || "",
+          note: kv["notiz"] || kv["note"] || kv["hinweis"] || "",
+        }};
+      }
+
+      if (type === "restaurant") {
+        return { type: "restaurant", data: {
+          name: kv["name"] || "",
+          city: cityNorm(kv["stadt"] || kv["city"]),
+          address: kv["adresse"] || kv["address"] || "",
+          lat: kv["lat"] || "",
+          lng: kv["lng"] || kv["lon"] || "",
+          openHours: kv["oeffnungszeiten"] || kv["opening_hours"] || kv["oeffnungszeit"] || "",
+          closedDay: kv["ruhetag"] || kv["closed"] || "",
+          priceJPY: kv["preis"] || kv["preis_jpy"] || kv["preis_pro_person"] || "",
+          note: kv["notiz"] || kv["note"] || "",
+          reserved: ["ja","yes","true"].includes((kv["reservierung"] || kv["reservation"] || "").toLowerCase()),
+        }};
+      }
+
+      if (type === "hotel") {
+        return { type: "hotel", data: {
+          name: kv["name"] || "",
+          city: cityNorm(kv["stadt"] || kv["city"]),
+          address: kv["adresse"] || kv["address"] || "",
+          lat: kv["lat"] || "",
+          lng: kv["lng"] || kv["lon"] || "",
+          checkin: kv["checkin"] || kv["check_in"] || kv["anreise"] || "",
+          checkout: kv["checkout"] || kv["check_out"] || kv["abreise"] || "",
+          nights: kv["naechte"] || kv["nights"] || kv["nächte"] || "",
+          priceJPY: kv["preis"] || kv["preis_jpy"] || kv["preis_pro_nacht"] || "",
+          note: kv["notiz"] || kv["note"] || "",
+        }};
+      }
+
+      if (type === "flight") {
+        return { type: "flight", data: {
+          flightNumber: kv["flugnummer"] || kv["flight_number"] || kv["flug"] || "",
+          airline: kv["airline"] || kv["fluggesellschaft"] || "",
+          from: kv["von"] || kv["abflug"] || kv["from"] || "",
+          to: kv["nach"] || kv["ankunft"] || kv["to"] || "",
+          dep: kv["abflugzeit"] || kv["dep"] || kv["abflug_uhrzeit"] || "",
+          arr: kv["ankunftszeit"] || kv["arr"] || kv["ankunft_uhrzeit"] || "",
+          dur: kv["dauer"] || kv["dur"] || kv["flugdauer"] || "",
+          aircraft: kv["flugzeug"] || kv["aircraft"] || kv["flugzeugtyp"] || "",
+          layover: kv["zwischenstopp"] || kv["layover"] || kv["stopp"] || "",
+          date: kv["datum"] || kv["date"] || "",
+          status: "scheduled",
+          note: kv["notiz"] || kv["note"] || "",
+        }};
+      }
+
+      if (type === "dayentry") {
+        const rawDay = kv["tag"] || kv["day"] || kv["datum"] || kv["reisetag"] || "";
+        const dayId = dayIdFromText(rawDay) ?? 0;
+        return { type: "dayentry", data: {
+          title: kv["titel"] || kv["name"] || kv["title"] || "",
+          dayId,
+          time: kv["uhrzeit"] || kv["time"] || kv["zeit"] || "",
+          tag: tagNorm(kv["kategorie"] || kv["tag"] || kv["category"]),
+          note: kv["notiz"] || kv["note"] || "",
+        }};
+      }
+
+      return null;
+    }
+
+    // ── PASTE IMPORTER COMPONENT ──────────────────────────────────────────────
+    function PasteImporter({ onImport }) {
+      const [open, setOpen] = useState(false);
+      const [text, setText] = useState("");
+      const [preview, setPreview] = useState(null);
+      const [error, setError] = useState("");
+      const taRef = useRef();
+
+      const parse = (val) => {
+        setError("");
+        if (!val.trim()) { setPreview(null); return; }
+        const result = parseClaudeText(val);
+        if (!result) {
+          setPreview(null);
+          setError("Format nicht erkannt. Stelle sicher, dass die erste Zeile z.B. #aktivität ist.");
+        } else {
+          setPreview(result);
+        }
+      };
+
+      const handleChange = (e) => { setText(e.target.value); parse(e.target.value); };
+
+      const confirm = () => {
+        if (!preview) return;
+        onImport(preview);
+        setText(""); setPreview(null); setError(""); setOpen(false);
+      };
+
+      const typeLabel = { activity:"Aktivität", restaurant:"Restaurant", hotel:"Unterkunft", flight:"Flug", dayentry:"Tageseintrag" };
+      const typeColor = { activity:"#ef4444", restaurant:"#f59e0b", hotel:"#94a3b8", flight:"#38bdf8", dayentry:"#a855f7" };
+
+      const previewTag = preview?.type === "activity" ? tagOf(preview.data.tag) :
+                         preview?.type === "restaurant" ? tagOf("food") :
+                         preview?.type === "hotel" ? tagOf("hotel") :
+                         preview?.type === "flight" ? tagOf("flight") :
+                         preview?.type === "dayentry" ? tagOf(preview.data.tag) : null;
+
+      return (
+        <div style={{marginBottom: 14}}>
+          {!open ? (
+            <button
+              onClick={()=>{setOpen(true); setTimeout(()=>taRef.current?.focus(),50);}}
+              style={{width:"100%",padding:"10px 16px",borderRadius:10,border:"1.5px dashed #d1d5db",background:"#fafafa",color:"#6b7280",cursor:"pointer",fontSize:13,fontFamily:"inherit",display:"flex",alignItems:"center",justifyContent:"center",gap:8}}
+            >
+              <span style={{fontSize:16}}>📋</span>
+              Claude-Output hier einfügen
+            </button>
+          ) : (
+            <div style={{background:"#fff",border:"1.5px solid #a855f7",borderRadius:12,padding:16}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                <span style={{fontWeight:500,fontSize:14,color:"#581c87"}}>📋 Claude-Output einfügen</span>
+                <button onClick={()=>{setOpen(false);setText("");setPreview(null);setError("");}} style={{background:"none",border:"none",fontSize:16,cursor:"pointer",color:"#9ca3af",padding:0}}>✕</button>
+              </div>
+              <textarea
+                ref={taRef}
+                value={text}
+                onChange={handleChange}
+                placeholder={`#aktivität\nname: Fushimi Inari Taisha\nstadt: Kyoto\nkategorie: temple\n…`}
+                style={{...inp, height:140, resize:"vertical", fontFamily:"monospace", fontSize:12, marginBottom:10}}
+              />
+              {error && <div style={{fontSize:12,color:"#dc2626",marginBottom:8}}>{error}</div>}
+              {preview && previewTag && (
+                <div style={{background:previewTag.bg, border:`1px solid ${previewTag.border}60`, borderRadius:10, padding:"12px 14px", marginBottom:10}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+                    <span style={{fontSize:18}}>{previewTag.emoji}</span>
+                    <span style={{fontWeight:500,fontSize:14,color:"#111827"}}>{preview.data.name||preview.data.title||preview.data.flightNumber||"—"}</span>
+                    <span style={{fontSize:11,padding:"2px 8px",borderRadius:999,background:"#fff",color:typeColor[preview.type],fontWeight:500,border:`1px solid ${typeColor[preview.type]}40`}}>{typeLabel[preview.type]}</span>
+                    {preview.data.city && <CityBadge city={preview.data.city}/>}
+                    {preview.type==="dayentry" && <span style={{fontSize:11,color:"#6b7280",marginLeft:4}}>{TRIP_DAYS[preview.data.dayId]?.label}</span>}
+                  </div>
+                  <div style={{display:"flex",flexWrap:"wrap",gap:"4px 16px",fontSize:12,color:"#374151"}}>
+                    {preview.data.address && <span>📍 {preview.data.address}</span>}
+                    {preview.data.openHours && <span>⏰ {preview.data.openHours}</span>}
+                    {preview.data.closedDay && <span>🚫 Ruhetag: {preview.data.closedDay}</span>}
+                    {preview.data.priceJPY && <span>¥ {Number(preview.data.priceJPY).toLocaleString()}</span>}
+                    {preview.data.from && <span>✈ {preview.data.from} → {preview.data.to}</span>}
+                    {preview.data.dep && <span>🕐 {preview.data.dep} → {preview.data.arr}</span>}
+                    {preview.data.note && <span>💬 {preview.data.note}</span>}
+                    {preview.data.time && <span>🕐 {preview.data.time}</span>}
+                    {preview.data.checkin && <span>📅 {preview.data.checkin} – {preview.data.checkout}</span>}
+                  </div>
+                </div>
+              )}
+              <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+                <button onClick={()=>{setOpen(false);setText("");setPreview(null);setError("");}} style={SEC}>Abbrechen</button>
+                <button onClick={confirm} disabled={!preview} style={{...PRI,opacity:preview?1:0.4}}>✓ Speichern</button>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── CLAUDE TIP TAB ────────────────────────────────────────────────────────
+    const FORMAT_EXAMPLES = {
+      activity: `#aktivität
+name: Fushimi Inari Taisha
+stadt: Kyoto
+kategorie: temple
+adresse: 68 Fushimiinari Yabunouchicho, Fushimi
+lat: 34.9671
+lng: 135.7727
+öffnungszeiten: 24 Stunden
+ruhetag: –
+preis: 0
+notiz: Früh morgens gehen, gegen 6 Uhr`,
+      restaurant: `#restaurant
+name: Ichiran Ramen Dotonbori
+stadt: Osaka
+adresse: 7-18 Soemoncho, Chuo-ku
+lat: 34.6694
+lng: 135.5010
+öffnungszeiten: 10:00–05:00
+ruhetag: –
+preis: 1200
+notiz: Solo-Kabinen, kein Englisch nötig`,
+      hotel: `#hotel
+name: Cross Hotel Osaka
+stadt: Osaka
+adresse: 2-5-15 Shinsaibashisuji, Chuo-ku
+lat: 34.6745
+lng: 135.5023
+checkin: 2026-05-12
+checkout: 2026-05-15
+nächte: 3
+preis: 12000
+notiz: Frühstück inklusive`,
+      flight: `#flug
+flugnummer: CX570
+airline: Cathay Pacific
+von: Frankfurt (FRA)
+nach: Hongkong (HKG)
+abflugzeit: 21:25
+ankunftszeit: 15:45+1
+dauer: 11h 20m
+flugzeug: Boeing 777-300ER
+datum: 2026-05-12
+zwischenstopp: –`,
+      dayentry: `#tag
+titel: Nishiki Market Besuch
+reisetag: 4
+uhrzeit: 10:00
+kategorie: food
+notiz: Probiere Takoyaki und Matcha-Snacks`,
+    };
+
     const CLAUDE_PROMPTS = [
-      { label:"Ort recherchieren", prompt:`Ich plane eine Japan-Reise (Osaka, Kyoto, Atami, Tokyo, 12.–28. Mai 2026). Gib mir für folgenden Ort kompakte Infos zum Eintragen in meinen Planer – Name, Adresse, GPS-Koordinaten, Öffnungszeiten, Ruhetag, Eintrittspreis in JPY, Kategorie (temple/nature/shopping/culture/food/transport):\n\n[ORT HIER EINGEBEN]` },
-      { label:"Restaurant finden", prompt:`Empfiehl mir ein gutes Restaurant in [STADT] für [ANLASS]. Gib mir: Name, Adresse, GPS-Koordinaten, Öffnungszeiten, Ruhetag, typischer Preis pro Person in JPY, Reservierung nötig ja/nein.` },
-      { label:"Tagesplan erstellen", prompt:`Erstelle mir einen Tagesplan für [DATUM] in [STADT]. Ich möchte [INTERESSEN]. Nenne: Uhrzeit, Ort, Kategorie (temple/nature/culture/food/shopping), kurze Notiz. Kompakt und realistisch.` },
-      { label:"Flugnummer nachschlagen", prompt:`Gib mir die Flugdetails für Flug [FLUGNUMMER] am [DATUM]: Airline, Abflughafen, Zielflughafen, Abflugzeit, Ankunftszeit, Flugdauer, Flugzeugtyp, Zwischenstopp falls vorhanden.` },
-      { label:"Hotel-Infos", prompt:`Gib mir kompakte Infos zu folgendem Hotel in Japan – Name, Adresse, GPS-Koordinaten, übliche Check-in/Check-out-Zeit, typischer Preis pro Nacht in JPY:\n\n[HOTEL NAME]` },
+      { label:"Aktivität / Sehenswürdigkeit", cat:"activity", prompt:`Gib mir Infos zu folgendem Ort für meinen Japan-Reiseplaner. Antworte NUR in diesem Format, ohne Erklärung:
+
+#aktivität
+name: [vollständiger Name]
+stadt: [Osaka/Kyoto/Atami/Tokyo]
+kategorie: [temple/nature/shopping/culture/transport]
+adresse: [Straße, Bezirk]
+lat: [Breitengrad als Zahl]
+lng: [Längengrad als Zahl]
+öffnungszeiten: [z.B. 09:00–17:00 oder 24 Stunden]
+ruhetag: [Wochentag oder –]
+preis: [Eintrittspreis in JPY oder 0]
+notiz: [1 hilfreicher Tipp]
+
+Ort: [ORT HIER EINGEBEN]` },
+      { label:"Restaurant", cat:"restaurant", prompt:`Gib mir Infos zu diesem Restaurant in Japan für meinen Reiseplaner. Antworte NUR in diesem Format:
+
+#restaurant
+name: [vollständiger Name]
+stadt: [Osaka/Kyoto/Atami/Tokyo]
+adresse: [Straße, Bezirk]
+lat: [Breitengrad]
+lng: [Längengrad]
+öffnungszeiten: [z.B. 11:00–22:00]
+ruhetag: [Wochentag oder –]
+preis: [typischer Preis pro Person in JPY]
+reservierung: [ja/nein]
+notiz: [1 hilfreicher Tipp]
+
+Restaurant: [NAME HIER EINGEBEN]` },
+      { label:"Hotel / Unterkunft", cat:"hotel", prompt:`Gib mir Infos zu diesem Hotel in Japan für meinen Reiseplaner. Antworte NUR in diesem Format:
+
+#hotel
+name: [vollständiger Name]
+stadt: [Osaka/Kyoto/Atami/Tokyo]
+adresse: [Straße, Bezirk]
+lat: [Breitengrad]
+lng: [Längengrad]
+checkin: [Datum als YYYY-MM-DD]
+checkout: [Datum als YYYY-MM-DD]
+nächte: [Anzahl]
+preis: [Preis pro Nacht in JPY]
+notiz: [1 hilfreicher Tipp]
+
+Hotel: [NAME HIER EINGEBEN]` },
+      { label:"Flug", cat:"flight", prompt:`Gib mir die Flugdaten für folgenden Flug. Antworte NUR in diesem Format:
+
+#flug
+flugnummer: [z.B. CX570]
+airline: [Fluggesellschaft]
+von: [Abflughafen mit Code]
+nach: [Zielflughafen mit Code]
+abflugzeit: [HH:MM]
+ankunftszeit: [HH:MM oder HH:MM+1]
+dauer: [z.B. 11h 20m]
+flugzeug: [Flugzeugtyp]
+datum: [YYYY-MM-DD]
+zwischenstopp: [Ort · Dauer oder –]
+
+Flug: [FLUGNUMMER] am [DATUM]` },
+      { label:"Tageseintrag", cat:"dayentry", prompt:`Erstelle einen Tageseintrag für meinen Japan-Reiseplaner. Antworte NUR in diesem Format:
+
+#tag
+titel: [Bezeichnung der Aktivität]
+reisetag: [Nummer 0–16, wobei 0=12.Mai Osaka, 4=16.Mai Kyoto, 9=21.Mai Tokyo]
+uhrzeit: [HH:MM]
+kategorie: [temple/nature/shopping/culture/food/transport]
+notiz: [kurze Notiz]
+
+Aktivität: [BESCHREIBUNG HIER EINGEBEN]` },
     ];
 
-    function ClaudeTab(){
+    function ClaudeTab({ onImport }) {
       const [copied, setCopied] = useState(null);
+      const [showFormat, setShowFormat] = useState(null);
       const copy = (text, i) => {
-        navigator.clipboard.writeText(text).then(()=>{ setCopied(i); setTimeout(()=>setCopied(null), 2000); });
+        navigator.clipboard.writeText(text).then(()=>{ setCopied(i); setTimeout(()=>setCopied(null), 2500); });
       };
+
       return <div>
+        <PasteImporter onImport={onImport} />
+
         <div style={{background:"#faf5ff",border:"1px solid #e9d5ff",borderRadius:12,padding:"16px 18px",marginBottom:16}}>
-          <div style={{fontWeight:500,fontSize:14,color:"#581c87",marginBottom:8}}>So nutzt du Claude als Recherche-Assistent</div>
-          <div style={{fontSize:13,color:"#6b21a8",lineHeight:1.7}}>
-            Öffne <a href="https://claude.ai" target="_blank" rel="noopener noreferrer" style={{color:"#7c3aed",fontWeight:500}}>claude.ai</a> im Browser, kopiere einen der Prompts unten, fülle die Lücken aus – und trag die Antwort dann hier manuell ein. Dauert ca. 30 Sekunden pro Ort.
+          <div style={{fontWeight:500,fontSize:14,color:"#581c87",marginBottom:6}}>So funktioniert der Workflow</div>
+          <div style={{fontSize:13,color:"#6b21a8",lineHeight:1.8}}>
+            <span style={{display:"block"}}>1. Wähle unten eine Prompt-Vorlage und kopiere sie</span>
+            <span style={{display:"block"}}>2. Füge sie in <a href="https://claude.ai" target="_blank" rel="noopener noreferrer" style={{color:"#7c3aed",fontWeight:500}}>claude.ai</a> ein und fülle die Lücken aus</span>
+            <span style={{display:"block"}}>3. Kopiere Claudes Antwort und füge sie oben ins Einfügefeld ein</span>
+            <span style={{display:"block"}}>4. Vorschau prüfen → Speichern ✓</span>
           </div>
         </div>
 
-        <div style={{fontSize:12,fontWeight:500,color:"#6b7280",marginBottom:10,textPtransform:"uppercase",letterSpacing:".04em"}}>VORLAGEN — klicken zum Kopieren</div>
-
+        <div style={{fontSize:12,fontWeight:500,color:"#6b7280",marginBottom:10,letterSpacing:".04em"}}>PROMPT-VORLAGEN</div>
         <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:20}}>
-          {CLAUDE_PROMPTS.map((p,i)=>(
-            <div key={i} style={{...card,marginBottom:0,cursor:"pointer"}} onClick={()=>copy(p.prompt,i)}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          {CLAUDE_PROMPTS.map((p,i) => (
+            <div key={i} style={{...card,marginBottom:0}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
                 <span style={{fontSize:13,fontWeight:500,color:"#111827"}}>{p.label}</span>
-                <span style={{fontSize:12,color:copied===i?"#059669":"#9ca3af",fontWeight:copied===i?500:400,transition:"color .2s"}}>
-                  {copied===i?"✓ Kopiert!":"Kopieren"}
-                </span>
+                <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                  <button onClick={()=>setShowFormat(showFormat===p.cat?null:p.cat)} style={{background:"none",border:"none",fontSize:12,color:"#9ca3af",cursor:"pointer",padding:0}}>
+                    {showFormat===p.cat?"Format verbergen":"Format ansehen"}
+                  </button>
+                  <button onClick={()=>copy(p.prompt,i)} style={{...PRI,fontSize:12,padding:"5px 14px"}}>
+                    {copied===i?"✓ Kopiert!":"Prompt kopieren"}
+                  </button>
+                </div>
               </div>
-              <div style={{fontSize:12,color:"#9ca3af",marginTop:4,lineHeight:1.5,whiteSpace:"pre-wrap"}}>{p.prompt.slice(0,120)}…</div>
+              {showFormat===p.cat && (
+                <pre style={{background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:8,padding:"10px 12px",fontSize:11,color:"#374151",fontFamily:"monospace",whiteSpace:"pre-wrap",marginTop:4,lineHeight:1.7}}>
+                  {FORMAT_EXAMPLES[p.cat]}
+                </pre>
+              )}
             </div>
           ))}
         </div>
 
         <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:12,padding:"14px 16px"}}>
-          <div style={{fontWeight:500,fontSize:13,color:"#14532d",marginBottom:6}}>Tipp: Google Maps Links</div>
-          <div style={{fontSize:13,color:"#166534",lineHeight:1.6}}>Kopiere einfach einen Google Maps Link und schreibe an Claude: <em>"Gib mir die Infos zu diesem Ort für meinen Japan-Reiseplaner: [LINK]"</em> – Claude sucht alles heraus.</div>
+          <div style={{fontWeight:500,fontSize:13,color:"#14532d",marginBottom:4}}>Tipp: Google Maps Links</div>
+          <div style={{fontSize:13,color:"#166534",lineHeight:1.6}}>Kopiere einen Google Maps Link und füge ihn in den Prompt ein. Claude erkennt den Ort automatisch und gibt dir das korrekte Format zurück.</div>
         </div>
       </div>;
     }
@@ -255,50 +629,44 @@
             </div>
           </div>)}
         </div>)}
-        <button onClick={onAdd} style={{...SEC,width:"100%",fontSize:12}}>+ Eintrag hinzufügen</button>
+        <button onClick={onAdd} style={{...SEC,width:"100%",fontSize:12}}>+ Eintrag manuell hinzufügen</button>
       </div>;
     }
 
     // ── Map Tab ───────────────────────────────────────────────────────────────
     const GMAPS_URL="https://www.google.com/maps/d/u/0/edit?mid=1U1lAjQ0NX7HycdQfr9S6jmIKgh3RU3U&usp=sharing";
-    function MapTab({data,filterTag}){
+    function MapTab({data,filterTag,onImport}){
       const places=[...(data.hotels||[]).map(h=>({...h,emoji:"🏨",_tag:"hotel"})),...(data.restaurants||[]).map(r=>({...r,emoji:"🍜",_tag:r.tag})),...(data.activities||[]).map(a=>({...a,emoji:tagOf(a.tag).emoji,_tag:a.tag}))].filter(p=>!filterTag||p.tag===filterTag||p._tag===filterTag);
       return <div>
+        <PasteImporter onImport={onImport}/>
         <div style={{background:"#eff6ff",border:"1px solid #bfdbfe",borderRadius:12,padding:"14px 16px",marginBottom:14}}>
           <div style={{fontWeight:500,fontSize:13,color:"#1e40af",marginBottom:6}}>🗺 Google My Maps</div>
           <a href={GMAPS_URL} target="_blank" rel="noopener noreferrer" style={{...PRI,textDecoration:"none",display:"inline-block",fontSize:12}}>Karte öffnen ↗</a>
         </div>
-        {CITIES.map(city=>{
-          const pts=places.filter(p=>p.city===city); if(!pts.length)return null;
-          const cs=cityOf(city);
-          return <div key={city} style={{marginBottom:16}}>
-            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
-              <span style={{fontWeight:500,fontSize:14}}>{city}</span>
-              <span style={{fontSize:11,background:cs.bg,color:cs.text,padding:"1px 7px",borderRadius:999}}>{pts.length} Orte</span>
-              <div style={{flex:1,height:1,background:"#f3f4f6"}}/>
-            </div>
-            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:8}}>
-              {pts.map((p,i)=><div key={i} style={{background:"#fff",border:`1px solid ${cs.border}30`,borderRadius:10,padding:"10px 12px"}}>
-                <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><span style={{fontWeight:500,fontSize:13}}>{p.emoji} {p.name}</span><MapBtn name={p.name} lat={p.lat} lng={p.lng}/></div>
-                {p.address&&<div style={{fontSize:11,color:"#9ca3af"}}>{p.address}</div>}
-                {p.openHours&&<div style={{fontSize:11,color:"#059669",marginTop:3}}>⏰ {p.openHours}</div>}
-                {(p.priceJPY||p.priceEUR)&&<div style={{marginTop:4}}><PriceTag jpy={p.priceJPY} eur={p.priceEUR}/></div>}
-              </div>)}
-            </div>
-          </div>;
-        })}
+        {CITIES.map(city=>{const pts=places.filter(p=>p.city===city);if(!pts.length)return null;const cs=cityOf(city);return <div key={city} style={{marginBottom:16}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><span style={{fontWeight:500,fontSize:14}}>{city}</span><span style={{fontSize:11,background:cs.bg,color:cs.text,padding:"1px 7px",borderRadius:999}}>{pts.length} Orte</span><div style={{flex:1,height:1,background:"#f3f4f6"}}/></div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:8}}>
+            {pts.map((p,i)=><div key={i} style={{background:"#fff",border:`1px solid ${cs.border}30`,borderRadius:10,padding:"10px 12px"}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><span style={{fontWeight:500,fontSize:13}}>{p.emoji} {p.name}</span><MapBtn name={p.name} lat={p.lat} lng={p.lng}/></div>
+              {p.address&&<div style={{fontSize:11,color:"#9ca3af"}}>{p.address}</div>}
+              {p.openHours&&<div style={{fontSize:11,color:"#059669",marginTop:3}}>⏰ {p.openHours}</div>}
+              {(p.priceJPY||p.priceEUR)&&<div style={{marginTop:4}}><PriceTag jpy={p.priceJPY} eur={p.priceEUR}/></div>}
+            </div>)}
+          </div>
+        </div>;})}
         {places.length===0&&<div style={{textAlign:"center",color:"#9ca3af",padding:"2rem",fontSize:13}}>Noch keine Orte gespeichert.</div>}
       </div>;
     }
 
     // ── Currency Tab ──────────────────────────────────────────────────────────
-    function CurrencyTab(){
+    function CurrencyTab({onImport}){
       const [jpy,setJpy]=useState("");const [eur,setEur]=useState("");
       const fromJ=v=>{setJpy(v);setEur(v?(v/EUR_JPY).toFixed(2):"");};
       const fromE=v=>{setEur(v);setJpy(v?Math.round(v*EUR_JPY):"");};
       const presets=[[500,"Kaffee"],[1000,"Snack"],[1500,"Ramen"],[3000,"Mittagessen"],[10000,"Eintritt"],[50000,"Hotel/Nacht"],[200000,"JR-Pass 7T"]];
       const costs=[["Kaffee","300–500 ¥","2–3 €"],["Ramen","800–1.200 ¥","5–7 €"],["Sushi (Kaiten)","150–400 ¥/Teller","1–2,50 €"],["Bento (Konbini)","400–700 ¥","2,50–4 €"],["Kaiseki-Menü","5.000–30.000 ¥","30–185 €"],["U-Bahn-Fahrt","150–350 ¥","1–2 €"],["Osaka–Kyoto","560 ¥","3,50 €"],["Shinkansen Osaka–Tokyo","13.910 ¥","86 €"],["JR Pass 7 Tage","50.000 ¥","308 €"],["Tempeleintritt","0–1.000 ¥","0–6 €"],["Hotel / Nacht","7.000–25.000 ¥","43–154 €"]];
       return <div>
+        <PasteImporter onImport={onImport}/>
         <div style={{...card,marginBottom:14}}>
           <div style={{fontWeight:500,fontSize:14,marginBottom:12}}>Währungsrechner · 1 € = ¥{EUR_JPY}</div>
           <div style={{display:"flex",gap:12,alignItems:"flex-end"}}>
@@ -306,9 +674,7 @@
             <div style={{paddingBottom:10,fontSize:18,color:"#9ca3af",flexShrink:0}}>⇄</div>
             <F label="Euro (€)"><input style={inp} type="number" value={eur} onChange={e=>fromE(e.target.value)} placeholder="9.23"/></F>
           </div>
-          <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:8}}>
-            {presets.map(([y,l])=><button key={y} onClick={()=>fromJ(y)} style={{background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:6,padding:"3px 9px",cursor:"pointer",fontSize:11,color:"#6b7280",fontFamily:"inherit"}}>¥{Number(y).toLocaleString()} ({l})</button>)}
-          </div>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:8}}>{presets.map(([y,l])=><button key={y} onClick={()=>fromJ(y)} style={{background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:6,padding:"3px 9px",cursor:"pointer",fontSize:11,color:"#6b7280",fontFamily:"inherit"}}>¥{Number(y).toLocaleString()} ({l})</button>)}</div>
         </div>
         <div style={card}>
           <div style={{fontWeight:500,fontSize:14,marginBottom:10}}>Typische Kosten</div>
@@ -318,7 +684,7 @@
     }
 
     // ── Docs Tab ──────────────────────────────────────────────────────────────
-    function DocsTab({docs,onAdd,onDelete}){
+    function DocsTab({docs,onAdd,onDelete,onImport}){
       const [open,setOpen]=useState(false);
       const [form,setForm]=useState({name:"",type:"ticket",dayId:"",note:"",dataURL:""});
       const [preview,setPreview]=useState(null);
@@ -326,6 +692,7 @@
       const DOC_TYPES={ticket:"🎫 Ticket",reservation:"📋 Reservierung",document:"📄 Dokument",insurance:"🛡 Versicherung",other:"📎 Sonstiges"};
       const handleFile=e=>{const file=e.target.files[0];if(!file)return;if(file.size>1.5*1024*1024){alert("Max 1,5 MB");return;}const r=new FileReader();r.onload=ev=>set("dataURL",ev.target.result);r.readAsDataURL(file);};
       return <div>
+        <PasteImporter onImport={onImport}/>
         {preview&&<div style={{background:"rgba(0,0,0,0.8)",borderRadius:12,padding:16,marginBottom:14,textAlign:"center"}}><button onClick={()=>setPreview(null)} style={{...SEC,marginBottom:10}}>Schließen</button>{preview.startsWith("data:image")?<img src={preview} style={{maxWidth:"100%",borderRadius:8}} alt="Vorschau"/>:<iframe src={preview} style={{width:"100%",height:500,border:"none",borderRadius:8}} title="Dokument"/>}</div>}
         {!open&&<button style={{...SEC,width:"100%",marginBottom:12}} onClick={()=>setOpen(true)}>+ Dokument / Ticket hinzufügen</button>}
         {open&&<Panel title="Dokument hinzufügen" onClose={()=>setOpen(false)}>
@@ -339,22 +706,7 @@
           <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}><button style={SEC} onClick={()=>setOpen(false)}>Abbrechen</button><button style={PRI} onClick={()=>{if(form.name.trim()){onAdd(form);setOpen(false);setForm({name:"",type:"ticket",dayId:"",note:"",dataURL:""});}}}>Speichern</button></div>
         </Panel>}
         {(docs||[]).length===0&&!open&&<div style={{textAlign:"center",color:"#9ca3af",padding:"2rem",fontSize:13}}>Noch keine Dokumente gespeichert.</div>}
-        {(docs||[]).map(d=>{
-          const day=d.dayId!==""&&d.dayId!=null?TRIP_DAYS[d.dayId]:null;
-          const ico=DOC_TYPES[d.type]?.split(" ")[0]||"📎";
-          return <div key={d.id} style={{...card,display:"flex",alignItems:"center",gap:12}}>
-            <div style={{fontSize:24,flexShrink:0}}>{ico}</div>
-            <div style={{flex:1,minWidth:0}}>
-              <div style={{fontWeight:500,fontSize:13}}>{d.name}</div>
-              <div style={{fontSize:12,color:"#6b7280",marginTop:3}}>{DOC_TYPES[d.type]||d.type}{day&&<span> · 📅 {day.label}</span>}</div>
-              {d.note&&<div style={{fontSize:12,color:"#9ca3af",marginTop:3}}>{d.note}</div>}
-            </div>
-            <div style={{display:"flex",gap:6,flexShrink:0}}>
-              {d.dataURL&&<button onClick={()=>setPreview(d.dataURL)} style={{...SEC,fontSize:12,padding:"4px 10px"}}>Ansehen</button>}
-              <button onClick={()=>onDelete(d.id)} style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:13}}>✕</button>
-            </div>
-          </div>;
-        })}
+        {(docs||[]).map(d=>{const day=d.dayId!==""&&d.dayId!=null?TRIP_DAYS[d.dayId]:null;const ico=DOC_TYPES[d.type]?.split(" ")[0]||"📎";return <div key={d.id} style={{...card,display:"flex",alignItems:"center",gap:12}}><div style={{fontSize:24,flexShrink:0}}>{ico}</div><div style={{flex:1,minWidth:0}}><div style={{fontWeight:500,fontSize:13}}>{d.name}</div><div style={{fontSize:12,color:"#6b7280",marginTop:3}}>{DOC_TYPES[d.type]||d.type}{day&&<span> · 📅 {day.label}</span>}</div>{d.note&&<div style={{fontSize:12,color:"#9ca3af",marginTop:3}}>{d.note}</div>}</div><div style={{display:"flex",gap:6,flexShrink:0}}>{d.dataURL&&<button onClick={()=>setPreview(d.dataURL)} style={{...SEC,fontSize:12,padding:"4px 10px"}}>Ansehen</button>}<button onClick={()=>onDelete(d.id)} style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:13}}>✕</button></div></div>;})}
       </div>;
     }
 
@@ -404,6 +756,7 @@
       const [filterTag,setFilterTag]=useState(null);
       const [syncing,setSyncing]=useState(false);
       const [syncOk,setSyncOk]=useState(false);
+      const [importSuccess,setImportSuccess]=useState("");
 
       const load=useCallback(async()=>{ const d=await sharedLoad(); if(d) setData(d); },[]);
       useEffect(()=>{ load(); const t=setInterval(load,25000); return()=>clearInterval(t); },[load]);
@@ -432,6 +785,36 @@
         setPanel(null);
       };
 
+      // ── IMPORT from PasteImporter ─────────────────────────────────────────
+      const handleImport = ({ type, data: d }) => {
+        const id = Date.now();
+        let next = { ...data };
+        const colMap = { activity:"activities", restaurant:"restaurants", hotel:"hotels", flight:"flights", dayentry:"days" };
+        const col = colMap[type];
+        if (!col) return;
+
+        const actTags = ["temple","nature","shopping","culture","transport","food"];
+
+        if (type === "dayentry") {
+          const entry = { ...d, id };
+          next = { ...next, days: [...(next.days||[]), entry] };
+          // Bidirectional: also create activity if tag matches
+          if (actTags.includes(d.tag) && d.title?.trim()) {
+            const city = TRIP_DAYS[d.dayId]?.city || "Tokyo";
+            const actId = id + 1;
+            const act = { id: actId, name: d.title, city, tag: d.tag, note: d.note||"", address:"", lat:"", lng:"", openHours:"", closedDay:"", priceJPY:"", priceEUR:"" };
+            next = { ...next, activities: [...(next.activities||[]), act], days: next.days.map(x => x.id===id ? {...x, linkedId: actId} : x) };
+          }
+        } else {
+          next = { ...next, [col]: [...(next[col]||[]), { ...d, id }] };
+        }
+
+        save(next);
+        const label = { activity:"Aktivität", restaurant:"Restaurant", hotel:"Unterkunft", flight:"Flug", dayentry:"Tageseintrag" }[type];
+        setImportSuccess(`✓ ${label} gespeichert!`);
+        setTimeout(() => setImportSuccess(""), 3000);
+      };
+
       const tabBtn=active=>({padding:"6px 12px",borderRadius:8,border:active?"1.5px solid #111827":"1px solid #e5e7eb",background:active?"#111827":"#fff",color:active?"#fff":"#6b7280",cursor:"pointer",fontSize:12,fontWeight:active?500:400,whiteSpace:"nowrap",fontFamily:"inherit"});
 
       return <div style={{fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",color:"#111827",background:"#f9fafb",minHeight:"100vh",fontSize:14}}>
@@ -439,7 +822,9 @@
           <span style={{fontSize:20}}>🗾</span>
           <div><div style={{fontWeight:500,fontSize:15}}>Japan 2026</div><div style={{fontSize:11,color:"#9ca3af"}}>12.–28. Mai · 2 Personen</div></div>
           <div style={{flex:1}}/>
-          <div style={{fontSize:11,fontWeight:500,color:syncing?"#d97706":syncOk?"#059669":"#9ca3af"}}>{syncing?"⟳ Sync…":syncOk?"✓ Gespeichert":"Cloud-Sync aktiv"}</div>
+          <div style={{fontSize:11,fontWeight:500,color:importSuccess?"#059669":syncing?"#d97706":syncOk?"#059669":"#9ca3af"}}>
+            {importSuccess||( syncing?"⟳ Sync…":syncOk?"✓ Gespeichert":"Cloud-Sync aktiv")}
+          </div>
         </div>
 
         <div style={{background:"#fff",borderBottom:"1px solid #e5e7eb",padding:"8px 14px",display:"flex",gap:5,overflowX:"auto"}}>
@@ -452,9 +837,11 @@
         </div>}
 
         <div style={{padding:"14px 16px",maxWidth:780,margin:"0 auto"}}>
-          {tab==="claude"&&<ClaudeTab/>}
+
+          {tab==="claude"&&<ClaudeTab onImport={handleImport}/>}
 
           {tab==="days"&&<div>
+            <PasteImporter onImport={handleImport}/>
             <div style={{display:"flex",gap:5,overflowX:"auto",marginBottom:12,paddingBottom:2}}>
               {TRIP_DAYS.map(d=>{const cs=cityOf(d.city);const active=selDay===d.id;return <button key={d.id} onClick={()=>{setSelDay(d.id);setPanel(null);}} style={{flexShrink:0,padding:"6px 10px",borderRadius:8,border:`1px solid ${active?cs.border:"#e5e7eb"}`,background:active?cs.bg:"#fff",color:active?cs.text:"#6b7280",cursor:"pointer",fontSize:11,fontWeight:active?500:400,fontFamily:"inherit"}}>{d.label}</button>;})}
             </div>
@@ -466,13 +853,15 @@
           </div>}
 
           {tab==="flights"&&<div>
+            <PasteImporter onImport={handleImport}/>
             {panel?.type==="flight"&&<Panel title={panel.item?.id?"Bearbeiten":"Hinzufügen"} onClose={()=>setPanel(null)}><FlightForm initial={panel.item} onSave={f=>upsert("flights",f)} onClose={()=>setPanel(null)}/></Panel>}
-            {(data.flights||[]).length===0&&!panel&&<div style={{textAlign:"center",padding:"3rem 1rem",color:"#9ca3af"}}><div style={{fontSize:36,marginBottom:10}}>✈</div><div style={{fontSize:13}}>Noch keine Flüge. Bekannte Flüge (CX570 etc.) können direkt aus der Datenbank geladen werden.</div></div>}
+            {(data.flights||[]).length===0&&!panel&&<div style={{textAlign:"center",padding:"3rem 1rem",color:"#9ca3af"}}><div style={{fontSize:36,marginBottom:10}}>✈</div><div style={{fontSize:13}}>Noch keine Flüge.</div></div>}
             {(data.flights||[]).map(f=><FlightCard key={f.id} f={f} onEdit={x=>openPanel("flight",x)} onDelete={id=>remove("flights",id)}/>)}
-            {!panel&&<button style={{...SEC,width:"100%"}} onClick={()=>openPanel("flight")}>+ Flug hinzufügen</button>}
+            {!panel&&<button style={{...SEC,width:"100%"}} onClick={()=>openPanel("flight")}>+ Flug manuell hinzufügen</button>}
           </div>}
 
           {tab==="hotels"&&<div>
+            <PasteImporter onImport={handleImport}/>
             {panel?.type==="hotel"&&<Panel title={panel.item?.id?"Bearbeiten":"Hinzufügen"} onClose={()=>setPanel(null)}><PlaceForm initial={panel.item} type="hotel" onSave={h=>upsert("hotels",h)} onClose={()=>setPanel(null)}/></Panel>}
             {(data.hotels||[]).map(h=>{const cs=cityOf(h.city);return <div key={h.id} style={{...card,borderLeft:`3px solid ${cs.border}`}}>
               <div style={{display:"flex",justifyContent:"space-between"}}>
@@ -489,11 +878,12 @@
                 <div style={{display:"flex",gap:6,marginLeft:8,flexShrink:0}}><MapBtn name={h.name} lat={h.lat} lng={h.lng}/><button onClick={()=>openPanel("hotel",h)} style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:13,padding:0}}>✎</button><button onClick={()=>remove("hotels",h.id)} style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:13,padding:0}}>✕</button></div>
               </div>
             </div>;})}
-            {(data.hotels||[]).length===0&&!panel&&<div style={{textAlign:"center",padding:"2rem",color:"#9ca3af",fontSize:13}}>Noch keine Unterkünfte eingetragen.</div>}
-            {!panel&&<button style={{...SEC,width:"100%"}} onClick={()=>openPanel("hotel")}>+ Unterkunft hinzufügen</button>}
+            {(data.hotels||[]).length===0&&!panel&&<div style={{textAlign:"center",padding:"2rem",color:"#9ca3af",fontSize:13}}>Noch keine Unterkünfte.</div>}
+            {!panel&&<button style={{...SEC,width:"100%"}} onClick={()=>openPanel("hotel")}>+ Unterkunft manuell hinzufügen</button>}
           </div>}
 
           {tab==="rests"&&<div>
+            <PasteImporter onImport={handleImport}/>
             {panel?.type==="restaurant"&&<Panel title={panel.item?.id?"Bearbeiten":"Hinzufügen"} onClose={()=>setPanel(null)}><PlaceForm initial={panel.item} type="restaurant" onSave={r=>upsert("restaurants",r)} onClose={()=>setPanel(null)}/></Panel>}
             {(data.restaurants||[]).map(r=><div key={r.id} style={{...card,borderLeft:"3px solid #f59e0b"}}>
               <div style={{display:"flex",justifyContent:"space-between"}}>
@@ -506,11 +896,12 @@
                 <div style={{display:"flex",gap:6,flexShrink:0,marginLeft:8}}><MapBtn name={r.name} lat={r.lat} lng={r.lng}/><button onClick={()=>openPanel("restaurant",r)} style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:13,padding:0}}>✎</button><button onClick={()=>remove("restaurants",r.id)} style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:13,padding:0}}>✕</button></div>
               </div>
             </div>)}
-            {(data.restaurants||[]).length===0&&!panel&&<div style={{textAlign:"center",padding:"2rem",color:"#9ca3af",fontSize:13}}>Noch keine Restaurants eingetragen.</div>}
-            {!panel&&<button style={{...SEC,width:"100%"}} onClick={()=>openPanel("restaurant")}>+ Restaurant hinzufügen</button>}
+            {(data.restaurants||[]).length===0&&!panel&&<div style={{textAlign:"center",padding:"2rem",color:"#9ca3af",fontSize:13}}>Noch keine Restaurants.</div>}
+            {!panel&&<button style={{...SEC,width:"100%"}} onClick={()=>openPanel("restaurant")}>+ Restaurant manuell hinzufügen</button>}
           </div>}
 
           {tab==="acts"&&<div>
+            <PasteImporter onImport={handleImport}/>
             {panel?.type==="activity"&&<Panel title={panel.item?.id?"Bearbeiten":"Hinzufügen"} onClose={()=>setPanel(null)}><PlaceForm initial={panel.item} type="activity" onSave={a=>upsert("activities",a)} onClose={()=>setPanel(null)}/></Panel>}
             <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(185px,1fr))",gap:10,marginBottom:12}}>
               {(data.activities||[]).filter(a=>!filterTag||a.tag===filterTag).map(a=>{const t=tagOf(a.tag);return <div key={a.id} style={{background:"#fff",border:`1px solid ${t.border}30`,borderRadius:12,padding:"12px 13px"}}>
@@ -521,14 +912,14 @@
                 {a.note&&<div style={{fontSize:11,color:"#9ca3af",marginTop:4}}>{a.note}</div>}
                 <button onClick={()=>promote(a)} style={{...SEC,width:"100%",fontSize:11,padding:"5px 0",marginTop:8}}>📅 In Tagesplan</button>
               </div>;})}
-              {(data.activities||[]).filter(a=>!filterTag||a.tag===filterTag).length===0&&<div style={{gridColumn:"1/-1",textAlign:"center",color:"#9ca3af",padding:"2rem",fontSize:13}}>Noch keine Aktivitäten eingetragen.</div>}
+              {(data.activities||[]).filter(a=>!filterTag||a.tag===filterTag).length===0&&<div style={{gridColumn:"1/-1",textAlign:"center",color:"#9ca3af",padding:"2rem",fontSize:13}}>Noch keine Aktivitäten.</div>}
             </div>
-            {!panel&&<button style={{...SEC,width:"100%"}} onClick={()=>openPanel("activity")}>+ Aktivität hinzufügen</button>}
+            {!panel&&<button style={{...SEC,width:"100%"}} onClick={()=>openPanel("activity")}>+ Aktivität manuell hinzufügen</button>}
           </div>}
 
-          {tab==="map"&&<MapTab data={data} filterTag={filterTag}/>}
-          {tab==="currency"&&<CurrencyTab/>}
-          {tab==="docs"&&<DocsTab docs={data.docs||[]} onAdd={d=>upsert("docs",d)} onDelete={id=>remove("docs",id)}/>}
+          {tab==="map"&&<MapTab data={data} filterTag={filterTag} onImport={handleImport}/>}
+          {tab==="currency"&&<CurrencyTab onImport={handleImport}/>}
+          {tab==="docs"&&<DocsTab docs={data.docs||[]} onAdd={d=>upsert("docs",d)} onDelete={id=>remove("docs",id)} onImport={handleImport}/>}
         </div>
       </div>;
     }
